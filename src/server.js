@@ -13,6 +13,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { serveDashboard } from './dashboard.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -190,6 +191,177 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // Priority endpoint — set an account's rotation priority (lower = preferred).
+      // Body: {"account": "<name|email>", "priority": <number>}.
+      // Local control only; the auth/cross-origin gate above applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/priority') {
+        if (!hooks.setPriority) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'priority updates not supported' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}');
+        } catch (err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.account !== 'string' || !body.account.trim() || typeof body.priority !== 'number' || !Number.isFinite(body.priority)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or invalid "account" / "priority"' }));
+          return;
+        }
+        try {
+          const result = await hooks.setPriority(body.account.trim(), body.priority);
+          console.log(`[TeamClaude] Set priority of "${result.name}" to ${result.priority} (manual)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      // Enable/disable endpoint — exclude or re-include an account from rotation.
+      // Body: {"account": "<name|email>", "disabled": <true|false>}.
+      // Local control only; the auth/cross-origin gate above applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/disable') {
+        if (!hooks.setDisabled) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'enable/disable not supported' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}');
+        } catch (err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.account !== 'string' || !body.account.trim() || typeof body.disabled !== 'boolean') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or invalid "account" / "disabled"' }));
+          return;
+        }
+        try {
+          const result = await hooks.setDisabled(body.account.trim(), body.disabled);
+          console.log(`[TeamClaude] ${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}" (manual)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      // Work context endpoints — read/write the project/PRD/PR/bead context that
+      // the MCP server sets on behalf of Claude Code sessions. These are local
+      // control endpoints (no upstream calls) and use the same cross-origin gate
+      // as reload/switch.
+      if (req.url === '/teamclaude/context' || req.url.startsWith('/teamclaude/context?')) {
+        const store = hooks.workContextStore;
+        if (!store) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'work context store not available' }));
+          return;
+        }
+        if (req.method === 'GET') {
+          const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+          const sessionId = url.searchParams.get('session_id') || req.headers['x-claude-code-session-id'] || null;
+          const ctx = sessionId ? store.get(sessionId) : null;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, context: ctx }));
+          return;
+        }
+        if (req.method === 'POST') {
+          let body;
+          try {
+            body = JSON.parse(await readControlBody(req) || '{}');
+          } catch (err) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid request body' }));
+            return;
+          }
+          const sessionId = body.session_id || req.headers['x-claude-code-session-id'] || null;
+          if (!sessionId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'missing session_id' }));
+            return;
+          }
+          let ctx;
+          if (body.action === 'release') {
+            ctx = store.release(sessionId);
+          } else if (body.action === 'claim') {
+            ctx = store.claim(sessionId, body);
+          } else {
+            ctx = store.setContext(sessionId, body);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, context: ctx }));
+          return;
+        }
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+        return;
+      }
+
+      if (req.url === '/teamclaude/contexts') {
+        const store = hooks.workContextStore;
+        if (!store) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'work context store not available' }));
+          return;
+        }
+        if (req.method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, contexts: store.activeContexts() }));
+          return;
+        }
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+        return;
+      }
+
+      if (req.url === '/teamclaude/usage') {
+        const store = hooks.workContextStore;
+        if (!store) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'work context store not available' }));
+          return;
+        }
+        if (req.method === 'GET') {
+          const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+          const groupBy = url.searchParams.get('group_by') || 'projectSlug';
+          const hours = Math.min(168, Math.max(1, parseInt(url.searchParams.get('hours') || '24', 10) || 24));
+          const filters = {};
+          if (url.searchParams.get('project_slug')) filters.projectSlug = url.searchParams.get('project_slug');
+          if (url.searchParams.get('prd_id')) filters.prdId = parseInt(url.searchParams.get('prd_id'), 10);
+          if (url.searchParams.get('bead_id')) filters.beadId = url.searchParams.get('bead_id');
+          const summary = store.usageSummary({ groupBy, hours, filters });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...summary }, null, 2));
+          return;
+        }
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+        return;
+      }
+
+      // Web dashboard — served from the same origin so its JS can call the
+      // /teamclaude/* control endpoints without triggering the cross-origin gate.
+      const path = req.url || '/';
+      if (path === '/dashboard' || path.startsWith('/dashboard/')) {
+        serveDashboard(req, res);
+        return;
+      }
+
       return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
@@ -244,7 +416,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 export function isSameOriginControlRequest(req) {
   const site = req.headers['sec-fetch-site'];
   if (site) return site === 'same-origin' || site === 'none';
-  return !req.headers.origin;
+  const origin = req.headers.origin;
+  if (!origin) return true; // curl / CLI.
+  // Some same-origin browsers (older Safari, certain privacy tools) send Origin
+  // without Sec-Fetch-Site. Treat the request as same-origin when Origin matches
+  // the Host the request was sent to. Cross-origin pages cannot forge this.
+  const host = req.headers.host;
+  if (!host) return false;
+  const proto = req.headers['x-forwarded-proto']
+    || (req.socket?.encrypted ? 'https' : 'http');
+  return origin === `${proto}://${host}`;
 }
 
 // Read a control-endpoint body as text. Capped, unlike the proxied request path:
@@ -497,7 +678,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      const workContext = hooks.workContextStore?.get(sessionId) || null;
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, workContext };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1094,21 +1276,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx, hooks.workContextStore);
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, ctx, hooks.workContextStore);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
     }
   } catch (err) {
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
-
-    logRequestHead();
-    const l = getLog();
-    if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
     const isTransient = err instanceof Error &&
       (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
@@ -1117,6 +1295,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
         err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
         err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
+
+    if (hooks.logUpstreamError) {
+      hooks.logUpstreamError({ account: account.name, message: err.message, code: err.code, transient: isTransient });
+    }
+
+    logRequestHead();
+    const l = getLog();
+    if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
     // Transient network errors (including a stale-socket headers/body timeout):
     // close the connection and let the client retry. Failing over to another
@@ -1197,7 +1383,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, ctx, workContextStore) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1226,7 +1412,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, ctx, workContextStore);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1246,7 +1432,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, ctx, workContextStore);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1264,7 +1450,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, ctx, workContextStore) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -1272,23 +1458,48 @@ function parseSSEUsage(event, accountIndex, accountManager) {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      recordContextUsage(ctx, workContextStore, accountManager, accountIndex, data.message.usage.input_tokens, 0);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      recordContextUsage(ctx, workContextStore, accountManager, accountIndex, 0, data.usage.output_tokens);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, ctx, workContextStore) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      recordContextUsage(ctx, workContextStore, accountManager, accountIndex, json.usage.input_tokens, json.usage.output_tokens);
     }
   } catch {
     // not JSON or no usage
   }
+}
+
+function recordContextUsage(ctx, workContextStore, accountManager, accountIndex, inputTokens, outputTokens) {
+  if (!workContextStore || !ctx?.workContext) return;
+  const account = accountManager.accounts[accountIndex];
+  workContextStore.recordUsage({
+    timestamp: Date.now(),
+    sessionId: ctx.sessionId,
+    accountName: account?.name || '(unknown)',
+    accountIndex,
+    model: ctx.model || null,
+    inputTokens: inputTokens || 0,
+    outputTokens: outputTokens || 0,
+    tenantSlug: ctx.workContext.tenantSlug,
+    projectSlug: ctx.workContext.projectSlug,
+    projectId: ctx.workContext.projectId,
+    prdId: ctx.workContext.prdId,
+    prNumber: ctx.workContext.prNumber,
+    beadId: ctx.workContext.beadId,
+    agentRef: ctx.workContext.agentRef,
+    rigName: ctx.workContext.rigName,
+  });
 }
 
 // Rewrite the `model` field in a JSON request body using a per-account map.

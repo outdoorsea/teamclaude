@@ -110,6 +110,16 @@ export class SessionTracker {
     }
   }
 
+  // Re-index session pins after an account is removed. Sessions pinned to the
+  // removed account are un-pinned (will re-select on next request); pins above
+  // the removed index are decremented to stay aligned with the shrunk array.
+  removeAccountIndex(removedIndex) {
+    for (const s of this.sessions.values()) {
+      if (s.accountIndex === removedIndex) s.accountIndex = null;
+      else if (s.accountIndex != null && s.accountIndex > removedIndex) s.accountIndex--;
+    }
+  }
+
   // { known, active, perAccount: { [index]: activeCount } } — for status/TUI.
   // Sweeps as it goes so a long-lived headless server stays bounded.
   stats(now = this._now()) {

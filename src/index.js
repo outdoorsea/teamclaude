@@ -15,6 +15,8 @@ import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
+import { UsagePusher } from './usage-pusher.js';
+import { authorizeSwitchyard } from './switchyard-auth.js';
 import { TUI } from './tui.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
@@ -24,12 +26,16 @@ import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
+import { WorkContextStore } from './work-context.js';
+import { runMcpServer } from './mcp-server.js';
+import { installMcpServer, uninstallMcpServer, renderInstallResult } from './mcp-install.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
 
 switch (command) {
   case 'server':
+  case 'start':
     await serverCommand();
     break;
   case 'run':
@@ -108,6 +114,21 @@ switch (command) {
     await updateCommand();
     process.exit(0);
     break;
+  case 'mcp':
+    if (args[1] === 'install') {
+      await mcpInstallCommand();
+      process.exit(0);
+    }
+    if (args[1] === 'uninstall') {
+      await mcpUninstallCommand();
+      process.exit(0);
+    }
+    runMcpServer();
+    break;
+  case 'switchyard':
+    await switchyardCommand();
+    process.exit(0);
+    break;
   case 'version':
   case '--version':
   case '-V':
@@ -120,14 +141,86 @@ switch (command) {
     showHelp();
     break;
   default:
-    // No command or unknown command → start server
+    // Unknown command → error + help. No command → help. Starting the server
+    // now requires an explicit `server` or `start` subcommand.
     if (command && !command.startsWith('-')) {
       console.error(`Unknown command: ${command}\n`);
-      showHelp();
-      process.exit(1);
     }
-    await serverCommand();
-    break;
+    showHelp();
+    process.exit(command && !command.startsWith('-') ? 1 : 0);
+}
+
+// ── mcp install / uninstall ─────────────────────────────────
+
+async function mcpInstallCommand() {
+  const scope = argValue('--scope') || 'user';
+  try {
+    const result = await installMcpServer(scope);
+    console.log(renderInstallResult(result));
+  } catch (err) {
+    console.error(`Failed to install TeamClaude MCP server: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function mcpUninstallCommand() {
+  const scope = argValue('--scope') || 'user';
+  try {
+    const result = await uninstallMcpServer(scope);
+    console.log(renderInstallResult(result));
+  } catch (err) {
+    console.error(`Failed to uninstall TeamClaude MCP server: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── switchyard login ────────────────────────────────────────
+
+async function switchyardCommand() {
+  const sub = args[1];
+  if (sub === '--help' || sub === '-h' || !sub) {
+    console.log(`Usage: teamclaude switchyard login [--base-url URL]`);
+    console.log('');
+    console.log('Log in to switchyard.work via browser and save the API token to');
+    console.log('TeamClaude config, enabling the Switchyard usage pusher.');
+    return;
+  }
+  if (sub === 'login') {
+    await switchyardLoginCommand();
+    return;
+  }
+  console.error(`Unknown switchyard subcommand: ${sub}`);
+  console.error(`Usage: teamclaude switchyard login [--base-url URL]`);
+  process.exit(1);
+}
+
+async function switchyardLoginCommand() {
+  const baseUrl = argValue('--base-url') || process.env.SWITCHYARD_BASE_URL || 'https://switchyard.work';
+  try {
+    const result = await authorizeSwitchyard(baseUrl);
+    await atomicConfigUpdate(cfg => {
+      cfg.switchyard = cfg.switchyard || {};
+      cfg.switchyard.baseUrl = result.baseUrl;
+      cfg.switchyard.apiKey = result.token;
+      // Default push interval if not already set.
+      if (cfg.switchyard.usageIntervalSeconds == null) {
+        cfg.switchyard.usageIntervalSeconds = 300;
+      }
+    });
+    if (result.workspaces.length === 1) {
+      console.log(`Logged in to Switchyard. Scoped to workspace ${result.workspaces[0].slug}.`);
+    } else if (result.workspaces.length > 1) {
+      console.log(`Logged in to Switchyard. Token spans ${result.workspaces.length} workspaces:`);
+      for (const w of result.workspaces) console.log(`  • ${w.slug}`);
+    } else {
+      console.log('Logged in to Switchyard.');
+    }
+    console.log(`Saved to ${getConfigPath()}`);
+    console.log('Run `teamclaude service restart` if the server is running, or the pusher will pick it up on the next config reload.');
+  } catch (err) {
+    console.error(`Switchyard login failed: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 // ── server ──────────────────────────────────────────────────
@@ -148,6 +241,9 @@ async function serverCommand() {
 
   // --activity-log <file>
   const activityLogPath = argValue('--activity-log') || null;
+
+  // --usage-log <file> (also TEAMCLAUDE_USAGE_LOG or config.usageLogPath)
+  const usageLogPath = argValue('--usage-log') || process.env.TEAMCLAUDE_USAGE_LOG || config.usageLogPath || null;
 
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
@@ -242,6 +338,8 @@ async function serverCommand() {
   let prober = null;
   // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
   let warmer = null;
+  // Opt-in Switchyard usage push (config.switchyard.usageUrl, default null = off).
+  let usagePusher = null;
   const serverStartedAt = Date.now();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
@@ -252,6 +350,24 @@ async function serverCommand() {
     if (!r.ok) console.error(`[TeamClaude] sx.org disabled: ${r.error}`);
   } else if (config.sx?.mode) {
     await sx.setMode(config.sx.mode);
+  }
+
+  // Resolve Switchyard usage-push settings from env/config. Env wins.
+  function getSwitchyardUsageConfig(cfg) {
+    const baseUrl = process.env.TEAMCLAUDE_SWITCHYARD_BASE_URL
+      || process.env.SWITCHYARD_BASE_URL
+      || cfg?.switchyard?.baseUrl
+      || null;
+    const apiKey = process.env.TEAMCLAUDE_SWITCHYARD_API_KEY
+      || process.env.SWITCHYARD_API_TOKEN
+      || cfg?.switchyard?.apiKey
+      || null;
+    const envSeconds = process.env.TEAMCLAUDE_SWITCHYARD_USAGE_INTERVAL_SECONDS;
+    const cfgSeconds = cfg?.switchyard?.usageIntervalSeconds;
+    const intervalSeconds = envSeconds != null ? Number(envSeconds)
+      : cfgSeconds != null ? Number(cfgSeconds)
+      : 300;
+    return { baseUrl, apiKey, intervalMs: intervalSeconds * 1000 };
   }
 
   // Re-sync accounts from disk without a restart. The TUI's 'R' key, the
@@ -285,6 +401,15 @@ async function serverCommand() {
       if (ms !== warmer.intervalMs) {
         config.warmupSeconds = diskConfig.warmupSeconds || 0;
         warmer.reschedule(ms);
+      }
+    }
+    if (usagePusher) {
+      const sw = getSwitchyardUsageConfig(diskConfig);
+      const wasOn = usagePusher.intervalMs > 0 && usagePusher.baseUrl;
+      const nowOn = sw.intervalMs > 0 && sw.baseUrl;
+      if (sw.baseUrl !== usagePusher.baseUrl || sw.apiKey !== usagePusher.apiKey || sw.intervalMs !== usagePusher.intervalMs || nowOn !== wasOn) {
+        config.switchyard = diskConfig.switchyard || {};
+        usagePusher.reschedule(sw);
       }
     }
     return added;
@@ -375,8 +500,49 @@ async function serverCommand() {
     process.on('exit', () => aStream.end());
   }
 
+  // Work context store: maps Claude Code session ids to project/PRD/PR/bead
+  // context declared through the MCP server, and keeps a rolling usage ledger.
+  const workContextStore = new WorkContextStore({ usageLogPath });
+
+  // Rolling buffer of upstream errors so the dashboard can show whether a failure
+  // was TeamClaude-internal or a problem reaching Anthropic/upstream.
+  const MAX_UPSTREAM_ERRORS = 50;
+  const upstreamErrors = [];
+
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
+  // Account-level control from the dashboard: mutate config, save, and reload.
+  hooks.setPriority = async (accountName, priority) => {
+    const diskConfig = await loadOrCreateConfig();
+    const matches = matchAccounts(diskConfig.accounts, accountName);
+    if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
+    const account = matches[0];
+    account.priority = priority;
+    await saveConfig(diskConfig);
+    await reloadAccounts();
+    return { name: account.name, priority };
+  };
+  hooks.setDisabled = async (accountName, disabled) => {
+    const diskConfig = await loadOrCreateConfig();
+    const matches = matchAccounts(diskConfig.accounts, accountName);
+    if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
+    const account = matches[0];
+    if (disabled) account.disabled = true; else delete account.disabled;
+    await saveConfig(diskConfig);
+    await reloadAccounts();
+    return { name: account.name, disabled: !!account.disabled };
+  };
+  hooks.logUpstreamError = ({ account, message, code, transient }) => {
+    upstreamErrors.push({
+      timestamp: new Date().toISOString(),
+      account,
+      message,
+      code: code || null,
+      transient: !!transient,
+    });
+    if (upstreamErrors.length > MAX_UPSTREAM_ERRORS) upstreamErrors.shift();
+  };
+  hooks.workContextStore = workContextStore;
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
@@ -414,6 +580,19 @@ async function serverCommand() {
         error: null,
       })),
     },
+    switchyard: usagePusher?.getStatus() || {
+      enabled: false,
+      url: null,
+      intervalSeconds: 0,
+      running: false,
+      lastSuccessAt: null,
+      nextRunAt: null,
+      lastError: null,
+    },
+    contexts: {
+      active: workContextStore.activeContexts().length,
+    },
+    upstreamErrors: upstreamErrors.slice(-20),
   });
 
   const server = createProxyServer(accountManager, config, hooks, sx);
@@ -483,6 +662,11 @@ async function serverCommand() {
   });
   warmer.start();
 
+  // Start the opt-in Switchyard usage push (no-op when switchyard.usageUrl is unset).
+  const swUsage = getSwitchyardUsageConfig(config);
+  usagePusher = new UsagePusher(workContextStore, swUsage);
+  usagePusher.start();
+
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
@@ -503,6 +687,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    usagePusher?.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
@@ -1325,6 +1510,7 @@ async function removeCommand() {
   config.accounts.splice(config.accounts.indexOf(account), 1);
   await saveConfig(config);
   console.log(`Removed account "${account.name}"`);
+  await notifyRunningServer(config);
 }
 
 // ── route ───────────────────────────────────────────────────
@@ -1485,7 +1671,12 @@ function showHelp() {
 Usage: teamclaude [command] [options]
 
 Commands:
-  server              Start the proxy server (default; --headless to skip the TUI)
+  server | start      Start the proxy server (--headless to skip the TUI)
+  mcp                 Run the stdio MCP server for project-aware token tracking
+  mcp install         Register the MCP server with Claude Code [--scope user|project|local]
+  mcp uninstall       Remove the MCP server from Claude Code [--scope user|project|local]
+  switchyard login    Log in to switchyard.work via browser and save the API token
+                      to TeamClaude's config [--base-url URL]
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
@@ -1673,9 +1864,9 @@ function findConfigAccount(diskConfig, account) {
 }
 
 /**
- * Sync accounts from disk config: add new accounts and refresh credentials
- * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
- * Returns the number of new accounts added.
+ * Sync accounts from disk config: add new accounts, refresh credentials for
+ * existing ones, and remove accounts that are no longer on disk. Returns the
+ * number of newly added accounts (removals happen silently).
  */
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
@@ -1753,6 +1944,22 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }
   }
+
+  // Remove in-memory accounts that no longer exist on disk. Remove from the
+  // highest index downward so the AccountManager reindexing doesn't shift
+  // targets that are still queued for removal.
+  const unclaimed = [];
+  for (let i = 0; i < accountManager.accounts.length; i++) {
+    if (!claimed.has(i)) unclaimed.push(i);
+  }
+  for (let i = unclaimed.length - 1; i >= 0; i--) {
+    const idx = unclaimed[i];
+    const name = accountManager.accounts[idx]?.name || `index ${idx}`;
+    accountManager.removeAccount(idx);
+    memConfig.accounts.splice(idx, 1);
+    console.log(`[TeamClaude] Removed account "${name}" from running config`);
+  }
+
   return added;
 }
 
@@ -1822,8 +2029,8 @@ function startTerminalTitleUpdater(accountManager) {
 // Best-effort: tell a running server (if any) to re-sync accounts from config so
 // CLI changes take effect without a restart. A closed local port refuses the
 // connection immediately, so this is a no-op (and near-instant) when nothing is
-// running. Reload picks up new accounts, credential, priority, and enable/disable
-// changes; account removals still need a restart.
+// running. Reload picks up new accounts, removals, credential, priority, and
+// enable/disable changes.
 async function notifyRunningServer(config) {
   const port = config?.proxy?.port;
   if (!port) return;

@@ -126,3 +126,17 @@ test('isSameOriginControlRequest: Sec-Fetch-Site wins, Origin is the fallback', 
   // curl and the CLI.
   assert.equal(isSameOriginControlRequest(req({})), true);
 });
+
+test('isSameOriginControlRequest: Origin matching Host is accepted without Sec-Fetch-Site', () => {
+  // Older Safari and some privacy tools omit Sec-Fetch-Site on same-origin POSTs.
+  // The Origin header is still present and matches the request Host, which a
+  // cross-origin attacker cannot forge.
+  assert.equal(isSameOriginControlRequest({
+    headers: { origin: 'http://127.0.0.1:3456', host: '127.0.0.1:3456' },
+    socket: {},
+  }), true);
+  assert.equal(isSameOriginControlRequest({
+    headers: { origin: 'http://localhost:3456', host: '127.0.0.1:3456' },
+    socket: {},
+  }), false);
+});

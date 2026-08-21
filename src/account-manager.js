@@ -1314,6 +1314,7 @@ export class AccountManager {
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
     this.accounts.splice(index, 1);
+    this.sessionTracker.removeAccountIndex(index);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
       this.currentIndex = Math.max(0, this.accounts.length - 1);
