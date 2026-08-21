@@ -123,6 +123,9 @@ teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
 teamclaude api <path>        # Call an API endpoint with account credentials
+teamclaude switchyard login  # Log in to switchyard.work for usage push
+teamclaude mcp install       # Register the TeamClaude MCP server with Claude Code
+teamclaude mcp uninstall     # Remove the TeamClaude MCP server
 teamclaude update            # Check npm for a newer teamclaude and install it
 teamclaude version           # Print the installed version
 teamclaude help              # Show all commands

@@ -1,6 +1,6 @@
 # Design: Per-work-item token attribution via a TeamClaude MCP server
 
-**Status:** design / not yet implemented  
+**Status:** implemented — see [docs/switchyard.md](switchyard.md) for user-facing docs and `src/mcp-server.js`, `src/usage-pusher.js`, `src/work-context.js`, `src/switchyard-auth.js` for the code.  
 **Context:** Switchyard runs remotely at `switchyard.work`. Gas City rigs run locally and proxy Claude Code through TeamClaude. Switchyard needs per-project / per-PRD / per-PR / per-bead token usage, but it cannot see the local Claude Code sessions that incur the cost.
 
 ## The idea

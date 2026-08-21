@@ -16,7 +16,15 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "quotaProbeSeconds": 0,
+  "warmupSeconds": 0,
   "sx": { "apiKey": "your-sx-org-api-key", "mode": "always" },
+  "switchyard": {
+    "baseUrl": "https://switchyard.work",
+    "apiKey": "sy_...",
+    "usageIntervalSeconds": 300
+  },
+  "usageLogPath": "/home/you/.local/share/teamclaude/usage.log",
   "accounts": [
     {
       "name": "user@example.com (Acme)",
@@ -55,6 +63,10 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `noProxy` | Comma-separated hosts that bypass `upstreamProxy` (suffix match, `*` = all). Defaults to `NO_PROXY` from the environment |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off — see [sx.org proxy mode](proxy-modes.md#sxorg-proxy-mode) |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
+| `switchyard.baseUrl` | Switchyard instance URL. When set with a valid `apiKey`, TeamClaude pushes attributed token usage rows to Switchyard — see [Switchyard integration](switchyard.md) |
+| `switchyard.apiKey` | Switchyard API token from `teamclaude switchyard login` |
+| `switchyard.usageIntervalSeconds` | How often to push usage rows (`0` = off) |
+| `usageLogPath` | Local append-only log of attributed usage events. Defaults to a file next to the config |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
