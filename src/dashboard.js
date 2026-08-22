@@ -1,16 +1,3 @@
-import { readFile } from 'node:fs/promises';
-import { extname } from 'node:path';
-
-const MIME_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-};
-
 export function serveDashboard(req, res) {
   const url = req.url || '/';
   if (url === '/dashboard') {
@@ -371,10 +358,17 @@ function renderAccounts(data) {
     container.innerHTML = '<div class="empty">No accounts configured.</div>';
     return;
   }
-  const priorities = accounts.map(a => a.priority || 0);
+  // Keep the current account pinned to the top of the grid so it is visible
+  // immediately regardless of rotation order or priority.
+  const sorted = accounts.slice().sort((a, b) => {
+    if (a.name === data.currentAccount) return -1;
+    if (b.name === data.currentAccount) return 1;
+    return 0;
+  });
+  const priorities = sorted.map(a => a.priority || 0);
   const minPrio = Math.min(...priorities);
   const maxPrio = Math.max(...priorities);
-  container.innerHTML = accounts.map(acc => {
+  container.innerHTML = sorted.map(acc => {
     const isCurrent = acc.name === data.currentAccount;
     const statusClass = acc.disabled ? 'disabled' : acc.status;
     const q = acc.quota || {};

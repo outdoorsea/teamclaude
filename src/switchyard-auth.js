@@ -77,7 +77,7 @@ async function deviceCodeFlow(baseUrl, { fetchFn, log, opener }) {
   log('  ', verificationURL);
   log('');
 
-  await opener(verificationURL).catch(e => {
+  await opener(verificationURL).catch(() => {
     log(`(no browser could be auto-opened here — copy the URL into a browser on any device.)`);
   });
   log('Waiting for authorization... (this terminal polls the server)');

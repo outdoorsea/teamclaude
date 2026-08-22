@@ -284,7 +284,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           let body;
           try {
             body = JSON.parse(await readControlBody(req) || '{}');
-          } catch (err) {
+          } catch {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'invalid request body' }));
             return;

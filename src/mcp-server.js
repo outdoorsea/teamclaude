@@ -8,7 +8,6 @@
 // MCP surface: initialize, notifications/initialized, tools/list, tools/call.
 
 import { readFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 
 const CONTROL_URL = process.env.TEAMCLAUDE_MCP_URL || 'http://127.0.0.1:3456';
 const API_KEY = process.env.TEAMCLAUDE_API_KEY || '';
