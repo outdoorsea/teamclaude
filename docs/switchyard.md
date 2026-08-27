@@ -86,7 +86,7 @@ Gas City rigs can export these values as environment variables (`SW_TENANT_SLUG`
 
 ## Dashboard
 
-The web dashboard (`teamclaude attach` or `http://localhost:3456/teamclaude/dashboard`) shows whether Switchyard push is enabled and the last push status.
+The web dashboard (`teamclaude attach` or `http://localhost:3456/dashboard/`) shows whether Switchyard push is enabled and the last push status.
 
 ## Privacy and data sharing
 
