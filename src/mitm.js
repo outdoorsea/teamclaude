@@ -309,15 +309,28 @@ export function connectAuthorized(req, socket, proxyApiKey) {
 function reply200Raw(sock) { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }
 function reply502Raw(sock) { try { sock.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ } }
 
+// How long a client has to complete the TLS handshake on a locally-terminated
+// tunnel, and how long the test host waits for a request. A raw TLSSocket has no
+// handshakeTimeout of its own, so a client that CONNECTs and then sends nothing
+// held a socket (and the tunnel behind it) open for ever.
+const HANDSHAKE_TIMEOUT_MS = 30_000;
+
 function termClaude(clientSocket, head, key, cert, alpn) {
   if (head && head.length) clientSocket.unshift(head);
   const t = new tls.TLSSocket(clientSocket, { isServer: true, key, cert, ALPNProtocols: alpn });
   t.on('error', () => t.destroy());
+  // Scoped to the handshake only: an idle timer on a live session would cut a
+  // long-lived connection that is legitimately quiet. Cleared on 'secure'.
+  const timer = setTimeout(() => t.destroy(), HANDSHAKE_TIMEOUT_MS);
+  t.once('secure', () => clearTimeout(timer));
+  t.once('close', () => clearTimeout(timer));
   return t;
 }
 
 // Answer the built-in test host locally over h1 with a canned JSON response.
 function serveTest(tlsSock) {
+  // One request, one response: a peer that never sends the request is done.
+  tlsSock.setTimeout(HANDSHAKE_TIMEOUT_MS, () => tlsSock.destroy());
   let buf = Buffer.alloc(0);
   const onData = (chunk) => {
     buf = Buffer.concat([buf, chunk]);
