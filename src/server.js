@@ -1826,7 +1826,11 @@ function recordContextUsage(ctx, workContextStore, accountManager, accountIndex,
 export function rewriteModel(body, modelMap) {
   try {
     const obj = JSON.parse(body.toString('utf8'));
-    if (obj.model && modelMap[obj.model]) {
+    // Own keys only: the map is a plain object, so a model named
+    // "constructor" or "toString" would otherwise look up a prototype
+    // function, which JSON.stringify then drops — the request goes upstream
+    // with no model at all.
+    if (typeof obj.model === 'string' && Object.hasOwn(modelMap, obj.model) && typeof modelMap[obj.model] === 'string') {
       obj.model = modelMap[obj.model];
       return Buffer.from(JSON.stringify(obj), 'utf8');
     }
