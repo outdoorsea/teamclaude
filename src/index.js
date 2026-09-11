@@ -342,6 +342,10 @@ async function serverCommand() {
   // Opt-in Switchyard usage push (config.switchyard.usageUrl, default null = off).
   let usagePusher = null;
   const serverStartedAt = Date.now();
+  // Read once here, not per request: `teamclaude update` swaps package.json on
+  // disk while this process keeps running the old code, and status must report
+  // what is running, not what is installed.
+  const serverVersion = currentVersion();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -551,6 +555,7 @@ async function serverCommand() {
     // per-request gate in server.js picks it up.
     blockedModels: [...(config.blockedModels || [])],
     server: {
+      version: serverVersion,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
