@@ -733,6 +733,10 @@ async function importCommand() {
     const fromPath = argValue('--from') || '~/.claude/.credentials.json';
     try {
       creds = await importCredentials(fromPath);
+      // Say which source won. On macOS the default path weighs a leftover
+      // credentials file against the Keychain, and silently picking one of two
+      // plausible sources is how a stale import goes unnoticed.
+      if (creds.origin) console.log(`Reading credentials from ${creds.origin}`);
     } catch (err) {
       console.error(`Failed to import from ${fromPath}: ${err.message}`);
       process.exit(1);
@@ -1724,7 +1728,8 @@ Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
   --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
-                      on macOS the default falls back to the Keychain)
+                      on macOS the default also reads the Keychain and takes
+                      whichever holds the later expiry. --from is taken as given)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
