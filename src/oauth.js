@@ -55,8 +55,9 @@ function shapeCredentials(raw, origin) {
  * the account 401s afterwards — with nothing pointing back at the leftover file.
  * So at the default path on darwin both sources are read and the later expiry
  * wins. Existence decides nothing; freshness does. A tie goes to the Keychain,
- * which is the system of record on that platform. An explicit --from path is
- * always taken literally, on every platform.
+ * which is the system of record on that platform. Any OTHER path — including one
+ * passed with --from — is read exactly as given, on every platform; the choice
+ * keys off the resolved path, not off which flag supplied it.
  */
 export async function importCredentials(filePath, {
   home = homedir(), platform = process.platform, readKeychain = readKeychainCredentials } = {}) {
@@ -209,7 +210,10 @@ export async function fetchProfile(accessToken) {
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
+      // Carry the status alongside the message: callers must tell "this token is
+      // dead" (401/403) from "we could not reach the endpoint" (5xx, network),
+      // and parsing that back out of the string would be fragile.
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
     const data = await res.json();
     return {
@@ -225,6 +229,20 @@ export async function fetchProfile(accessToken) {
   } catch (err) {
     return { error: err.message || String(err) };
   }
+}
+
+/**
+ * Whether a failed fetchProfile proves the token is dead, as opposed to merely
+ * unreachable.
+ *
+ * Only the upstream rejecting the credentials outright (401/403) is proof. A
+ * 5xx, a timeout or a DNS failure says nothing about the token: a perfectly good
+ * one must still be importable from a restricted network, so those stay
+ * advisory. Treating "cannot tell" as "dead" would block legitimate imports
+ * every time the profile endpoint had a bad minute.
+ */
+export function isTokenRejection(profile) {
+  return profile?.status === 401 || profile?.status === 403;
 }
 
 // Pull a per-model weekly limit out of the payload's `limits[]` array, which is

@@ -8,7 +8,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, isTokenRejection } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
@@ -1728,8 +1728,9 @@ Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
   --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
-                      on macOS the default also reads the Keychain and takes
-                      whichever holds the later expiry. --from is taken as given)
+                      on macOS that path also reads the Keychain and takes
+                      whichever holds the later expiry. Any other path is read
+                      as given)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
@@ -1801,6 +1802,21 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   const profileOk = profile && !profile.error;
 
   if (!profileOk) {
+    // A 401/403 here is the upstream saying these credentials are dead. Saving
+    // the account anyway stores something that can never serve a request, and
+    // because the failed fetch also leaves accountUuid null, a later good import
+    // cannot even repair it: sameIdentity() falls back to matching on the display
+    // name, the names differ, and a SECOND account is added beside the corpse.
+    // Refuse instead, and say what to run.
+    if (isTokenRejection(profile)) {
+      console.error(`Refusing to add the account: ${profile.error}`);
+      console.error('These credentials are expired or revoked, so the account could never serve a request.\n');
+      console.error('  teamclaude login               fresh browser login');
+      console.error('  teamclaude import --from PATH   import from a specific credentials file');
+      process.exit(1);
+    }
+    // Anything else (5xx, timeout, DNS) says nothing about the token itself, and
+    // a healthy one must stay importable from a restricted network.
     console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
   }
   if (!name && profile?.email) {
