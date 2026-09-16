@@ -68,6 +68,14 @@ export function findUpsertTarget(accounts, incoming) {
   return accounts.findIndex(a => a.name === incoming.name && !distinctAccounts(a, incoming));
 }
 
+/**
+ * Short human label for an account's organization, for disambiguating two
+ * entries that would otherwise share one email-derived display name.
+ */
+export function orgLabel(acct) {
+  return acct.orgName || (acct.orgUuid ? acct.orgUuid.slice(0, 8) : 'org');
+}
+
 /** The email portion of a display name, stripping any " (org)" suffix. */
 export function emailOf(acct) {
   return (acct?.name || '').replace(/ \(.*\)$/, '');
