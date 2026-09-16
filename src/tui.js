@@ -1,6 +1,7 @@
 import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity, findUpsertTarget } from './identity.js';
+import { sameIdentity } from './identity.js';
+import { planAccountUpsert, applyAccountPlan } from './account-upsert.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -875,70 +876,39 @@ export class TUI {
       this._addLog('Importing credentials...');
       const creds = await this._readCredentials('~/.claude/.credentials.json');
       const profile = await this._readProfile(creds.accessToken);
-      const profileOk = profile && !profile.error;
+      const plan = planAccountUpsert({ accounts: this.config.accounts, creds, profile, source: 'import' });
 
-      if (!profileOk) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
+      for (const n of plan.notices) {
+        this._addLog(n.level === 'warn' ? `Warning: ${n.text}` : n.text);
       }
 
-      let name;
-      if (profile?.email) {
-        name = profile.email;
-        const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
-        if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
-      } else {
-        const n = this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-        name = `account-${n}`;
+      // Same rule as the CLI, but this process IS the running server: report and
+      // return rather than exiting, which would take the proxy down with it.
+      if (plan.action === 'reject') {
+        this._addLog(`Import refused: ${plan.reason}`);
+        this._addLog('Credentials are expired or revoked — run: teamclaude login');
+        return;
       }
 
-      const entry = {
-        name, type: 'oauth', source: 'import',
-        accountUuid: profile?.accountUuid || null,
-        orgUuid: profile?.orgUuid || null,
-        orgName: profile?.orgName || null,
-        accessToken: creds.accessToken,
-        refreshToken: creds.refreshToken,
-        expiresAt: creds.expiresAt,
-      };
+      const saved = applyAccountPlan(this.config.accounts, plan);
 
-      // Same rule as the login path: a name match counts only where it is not
-      // standing in for a different account+org. Both organizations of one person
-      // carry the same email-derived name, and overwriting on that match drops an
-      // account here AND rewrites the running one's identity below.
-      const idx = findUpsertTarget(this.config.accounts, entry);
-
-      if (idx >= 0) {
-        const prev = this.config.accounts[idx];
-        this.config.accounts[idx] = { ...prev, ...entry, name: prev.name };
-        // Update the running account manager entry
-        const amAcct = this.am.accounts.find(a => sameIdentity(a, entry)) || this.am.accounts[idx];
+      if (plan.action === 'update') {
+        // Carry the new credentials into the live rotation entry too, so the
+        // running proxy picks them up without a reload.
+        const amAcct = this.am.accounts.find(a => sameIdentity(a, plan.account)) || this.am.accounts[plan.index];
         if (amAcct) {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
-          amAcct.accountUuid = entry.accountUuid;
-          amAcct.orgUuid = entry.orgUuid;
-          amAcct.orgName = entry.orgName;
+          amAcct.accountUuid = plan.account.accountUuid;
+          amAcct.orgUuid = plan.account.orgUuid;
+          amAcct.orgName = plan.account.orgName;
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
-        this._addLog(`Updated account "${prev.name}"`);
+        this._addLog(`Updated account "${plan.previousName}"`);
       } else {
-        // New org for this person: disambiguate colliding email names with " (org)".
-        if (profile?.accountUuid) {
-          const orgLbl = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
-          const collisions = this.config.accounts.filter(
-            a => a.accountUuid === entry.accountUuid && !sameIdentity(a, entry)
-          );
-          if (collisions.length > 0) {
-            for (const c of collisions) {
-              if (!c.name.includes(' (')) c.name = `${c.name} (${orgLbl(c)})`;
-            }
-            entry.name = `${name} (${orgLbl(entry)})`;
-          }
-        }
-        this.config.accounts.push(entry);
-        this.am.addAccount(entry);
-        this._addLog(`Imported account "${entry.name}"`);
+        this.am.addAccount(saved);
+        this._addLog(`Imported account "${saved.name}"`);
       }
 
       await this.saveConfig(this.config);

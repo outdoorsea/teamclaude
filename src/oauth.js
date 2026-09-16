@@ -14,34 +14,25 @@ const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
 /**
  * Read Claude Code credentials from the macOS Keychain, where Claude Code
- * stores them on darwin (there is no ~/.claude/.credentials.json on macOS).
+ * stores them on darwin.
  */
 async function readKeychainCredentials() {
   const { stdout } = await execFileAsync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w']);
   return JSON.parse(stdout.trim());
 }
 
-/**
- * Import OAuth credentials from a Claude Code credentials file.
- * On macOS the default credentials location is the Keychain, not a file, so
- * when the default path is missing the Keychain is tried before giving up.
- */
-export async function importCredentials(filePath, {
-  home = homedir(), platform = process.platform, readKeychain = readKeychainCredentials } = {}) {
-  const resolvedPath = filePath.replace(/^~/, home);
-  let raw;
-  try {
-    raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
-  } catch (err) {
-    const isDefaultPath = resolvedPath === DEFAULT_CREDENTIALS_PATH.replace(/^~/, home);
-    if (err.code !== 'ENOENT' || platform !== 'darwin' || !isDefaultPath) throw err;
-    try {
-      raw = await readKeychain();
-    } catch (kcErr) {
-      throw new Error(`${err.message}; macOS Keychain lookup for "${KEYCHAIN_SERVICE}" also failed: ${kcErr.message}`);
-    }
-  }
+const KEYCHAIN_ORIGIN = `macOS Keychain (${KEYCHAIN_SERVICE})`;
 
+/** Settle a promise to { value } or { error }, so both sources can be weighed. */
+const attempt = (promise) => promise.then((value) => ({ value }), (error) => ({ error }));
+
+/** Expiry of a raw credentials blob in ms, or 0 when it carries none. */
+function credentialsExpiry(raw) {
+  const data = raw?.claudeAiOauth || raw || {};
+  return normalizeExpiresAt(data.expiresAt) || 0;
+}
+
+function shapeCredentials(raw, origin) {
   // Claude Code stores credentials nested under "claudeAiOauth"
   const data = raw.claudeAiOauth || raw;
   return {
@@ -50,7 +41,48 @@ export async function importCredentials(filePath, {
     expiresAt: data.expiresAt,
     subscriptionType: data.subscriptionType,
     rateLimitTier: data.rateLimitTier,
+    origin,
   };
+}
+
+/**
+ * Import OAuth credentials from a Claude Code credentials file.
+ *
+ * On macOS the live credentials are in the Keychain, but a
+ * ~/.claude/.credentials.json can outlive an older Claude Code that kept them in
+ * a file. Letting that file win merely because it exists silently imports tokens
+ * that went stale months ago: the import reports success, and every request on
+ * the account 401s afterwards — with nothing pointing back at the leftover file.
+ * So at the default path on darwin both sources are read and the later expiry
+ * wins. Existence decides nothing; freshness does. A tie goes to the Keychain,
+ * which is the system of record on that platform. Any OTHER path — including one
+ * passed with --from — is read exactly as given, on every platform; the choice
+ * keys off the resolved path, not off which flag supplied it.
+ */
+export async function importCredentials(filePath, {
+  home = homedir(), platform = process.platform, readKeychain = readKeychainCredentials } = {}) {
+  const resolvedPath = filePath.replace(/^~/, home);
+  const isDefaultPath = resolvedPath === DEFAULT_CREDENTIALS_PATH.replace(/^~/, home);
+
+  const file = await attempt(readFile(resolvedPath, 'utf-8').then(JSON.parse));
+
+  // One source only: an explicit path, or a platform with no Keychain.
+  if (platform !== 'darwin' || !isDefaultPath) {
+    if (file.error) throw file.error;
+    return shapeCredentials(file.value, resolvedPath);
+  }
+
+  const keychain = await attempt(readKeychain());
+
+  if (file.error && keychain.error) {
+    throw new Error(`${file.error.message}; macOS Keychain lookup for "${KEYCHAIN_SERVICE}" also failed: ${keychain.error.message}`);
+  }
+  if (keychain.error) return shapeCredentials(file.value, resolvedPath);
+  if (file.error) return shapeCredentials(keychain.value, KEYCHAIN_ORIGIN);
+
+  return credentialsExpiry(keychain.value) >= credentialsExpiry(file.value)
+    ? shapeCredentials(keychain.value, KEYCHAIN_ORIGIN)
+    : shapeCredentials(file.value, resolvedPath);
 }
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
@@ -178,7 +210,10 @@ export async function fetchProfile(accessToken) {
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
+      // Carry the status alongside the message: callers must tell "this token is
+      // dead" (401/403) from "we could not reach the endpoint" (5xx, network),
+      // and parsing that back out of the string would be fragile.
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
     const data = await res.json();
     return {
@@ -194,6 +229,20 @@ export async function fetchProfile(accessToken) {
   } catch (err) {
     return { error: err.message || String(err) };
   }
+}
+
+/**
+ * Whether a failed fetchProfile proves the token is dead, as opposed to merely
+ * unreachable.
+ *
+ * Only the upstream rejecting the credentials outright (401/403) is proof. A
+ * 5xx, a timeout or a DNS failure says nothing about the token: a perfectly good
+ * one must still be importable from a restricted network, so those stay
+ * advisory. Treating "cannot tell" as "dead" would block legitimate imports
+ * every time the profile endpoint had a bad minute.
+ */
+export function isTokenRejection(profile) {
+  return profile?.status === 401 || profile?.status === 403;
 }
 
 // Pull a per-model weekly limit out of the payload's `limits[]` array, which is

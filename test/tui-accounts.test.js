@@ -213,3 +213,42 @@ test('re-importing the same account+org still updates in place', async () => {
   assert.equal(calls.added.length, 0);
   assert.equal(am.accounts[0].credential, 'fresh');
 });
+
+// The TUI carried its own copy of the import rules, so fixes to `teamclaude
+// import` never reached [g] → Add account. Both paths now share one planner.
+
+test('refuses a token the upstream rejected instead of storing a dead account', async () => {
+  const { tui, config, calls } = makeTUI();
+  config.accounts = [];
+  tui._readCredentials = async () => ({ accessToken: 'dead', refreshToken: 'r', expiresAt: Date.now() - 1000 });
+  tui._readProfile = async () => ({ error: 'HTTP 401: OAuth access token has expired', status: 401 });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts.length, 0);
+  assert.equal(calls.added.length, 0);
+});
+
+test('a refused import leaves the TUI running', async () => {
+  // The CLI exits here; this process is the proxy, so it must not.
+  const { tui } = makeTUI();
+  tui._readCredentials = async () => ({ accessToken: 'dead', refreshToken: 'r', expiresAt: 0 });
+  tui._readProfile = async () => ({ error: 'HTTP 403: revoked', status: 403 });
+
+  await tui._doImport();
+
+  assert.ok(tui.log.some(l => /refused/i.test(l.msg)), 'expected a refusal in the log pane');
+});
+
+test('an unreachable profile endpoint still imports', async () => {
+  // Only a rejection is proof; a network failure must not block a good token.
+  const { tui, config, calls } = makeTUI();
+  config.accounts = [];
+  tui._readCredentials = async () => ({ accessToken: 'good', refreshToken: 'r', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ error: 'fetch failed' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts.length, 1);
+  assert.equal(calls.added.length, 1);
+});

@@ -9,7 +9,8 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
-import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
+import { planAccountUpsert, applyAccountPlan } from './account-upsert.js';
+import { sameIdentity, orgKey, matchAccounts, orgLabel } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -733,6 +734,10 @@ async function importCommand() {
     const fromPath = argValue('--from') || '~/.claude/.credentials.json';
     try {
       creds = await importCredentials(fromPath);
+      // Say which source won. On macOS the default path weighs a leftover
+      // credentials file against the Keychain, and silently picking one of two
+      // plausible sources is how a stale import goes unnoticed.
+      if (creds.origin) console.log(`Reading credentials from ${creds.origin}`);
     } catch (err) {
       console.error(`Failed to import from ${fromPath}: ${err.message}`);
       process.exit(1);
@@ -1724,7 +1729,9 @@ Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
   --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
-                      on macOS the default falls back to the Keychain)
+                      on macOS that path also reads the Keychain and takes
+                      whichever holds the later expiry. Any other path is read
+                      as given)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
@@ -1784,70 +1791,28 @@ Crash log: ${getCrashLogPath()} (server; written when the process dies unexpecte
 
 // ── shared account upsert ────────────────────────────────────
 
-/** Short human label for an account's organization, for disambiguating names. */
-function orgLabel(a) {
-  return a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
-}
-
 async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account+org identity.
-  const userNamed = !!name;
   const profile = await fetchProfile(creds.accessToken);
-  const profileOk = profile && !profile.error;
+  const plan = planAccountUpsert({ accounts: config.accounts, name, creds, profile, source });
 
-  if (!profileOk) {
-    console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
-  }
-  if (!name && profile?.email) {
-    name = profile.email;
-    const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
-    if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
-  }
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-    name = `account-${n}`;
+  for (const n of plan.notices) {
+    if (n.level === 'warn') console.error(`Warning: ${n.text}`);
+    else console.log(n.text);
   }
 
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    accountUuid: profile?.accountUuid || null,
-    orgUuid: profile?.orgUuid || null,
-    orgName: profile?.orgName || null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate by account+org identity (same email in a different org is a
-  // distinct account), then by name — but only where the name is not standing in
-  // for a different account+org, which is exactly the multi-org case below.
-  const idx = findUpsertTarget(config.accounts, account);
-
-  if (idx >= 0) {
-    // Same account+org: refresh credentials and org info, but keep the existing
-    // display name and any disk-only fields (e.g. importFrom).
-    const prev = config.accounts[idx];
-    config.accounts[idx] = { ...prev, ...account, name: prev.name };
-    console.log(`Updated account "${prev.name}"`);
-  } else {
-    // New org for this person: if another entry shares the accountUuid, the bare
-    // email name would collide — disambiguate both with " (org)".
-    if (!userNamed && account.accountUuid) {
-      const collisions = config.accounts.filter(
-        a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
-      );
-      if (collisions.length > 0) {
-        for (const c of collisions) {
-          if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
-        }
-        account.name = `${name} (${orgLabel(account)})`;
-      }
-    }
-    config.accounts.push(account);
-    console.log(`Added account "${account.name}"`);
+  if (plan.action === 'reject') {
+    console.error(`Refusing to add the account: ${plan.reason}`);
+    console.error('These credentials are expired or revoked, so the account could never serve a request.\n');
+    console.error('  teamclaude login               fresh browser login');
+    console.error('  teamclaude import --from PATH   import from a specific credentials file');
+    process.exit(1);
   }
+
+  applyAccountPlan(config.accounts, plan);
+  console.log(plan.action === 'update'
+    ? `Updated account "${plan.previousName}"`
+    : `Added account "${plan.account.name}"`);
 
   await saveConfig(config);
   console.log(`Saved to ${getConfigPath()}`);
