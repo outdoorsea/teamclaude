@@ -8,6 +8,9 @@ import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { WorkContextStore } from './work-context.js';
 import { UsagePusher } from './usage-pusher.js';
+import { authorizeSwitchyard } from './switchyard-auth.js';
+import { runMcpServer } from './mcp-server.js';
+import { installMcpServer, uninstallMcpServer, renderInstallResult } from './mcp-install.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -185,6 +188,21 @@ switch (command) {
     await updateCommand();
     process.exit(0);
     break;
+  case 'mcp':
+    if (args[1] === 'install') {
+      await mcpInstallCommand();
+      process.exit(0);
+    }
+    if (args[1] === 'uninstall') {
+      await mcpUninstallCommand();
+      process.exit(0);
+    }
+    runMcpServer();
+    break;
+  case 'switchyard':
+    await switchyardCommand();
+    process.exit(0);
+    break;
   case 'version':
   case '--version':
   case '-V':
@@ -205,6 +223,79 @@ switch (command) {
     }
     await serverCommand();
     break;
+}
+
+// ── server ──────────────────────────────────────────────────
+
+async function mcpInstallCommand() {
+  const scope = argValue('--scope') || 'user';
+  try {
+    const result = await installMcpServer(scope);
+    console.log(renderInstallResult(result));
+  } catch (err) {
+    console.error(`Failed to install TeamClaude MCP server: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function mcpUninstallCommand() {
+  const scope = argValue('--scope') || 'user';
+  try {
+    const result = await uninstallMcpServer(scope);
+    console.log(renderInstallResult(result));
+  } catch (err) {
+    console.error(`Failed to uninstall TeamClaude MCP server: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── switchyard login ────────────────────────────────────────
+
+async function switchyardCommand() {
+  const sub = args[1];
+  if (sub === '--help' || sub === '-h' || !sub) {
+    console.log(`Usage: teamclaude switchyard login [--base-url URL]`);
+    console.log('');
+    console.log('Log in to switchyard.work via browser and save the API token to');
+    console.log('TeamClaude config, enabling the Switchyard usage pusher.');
+    return;
+  }
+  if (sub === 'login') {
+    await switchyardLoginCommand();
+    return;
+  }
+  console.error(`Unknown switchyard subcommand: ${sub}`);
+  console.error(`Usage: teamclaude switchyard login [--base-url URL]`);
+  process.exit(1);
+}
+
+async function switchyardLoginCommand() {
+  const baseUrl = argValue('--base-url') || process.env.SWITCHYARD_BASE_URL || 'https://switchyard.work';
+  try {
+    const result = await authorizeSwitchyard(baseUrl);
+    await atomicConfigUpdate(cfg => {
+      cfg.switchyard = cfg.switchyard || {};
+      cfg.switchyard.baseUrl = result.baseUrl;
+      cfg.switchyard.apiKey = result.token;
+      // Default push interval if not already set.
+      if (cfg.switchyard.usageIntervalSeconds == null) {
+        cfg.switchyard.usageIntervalSeconds = 300;
+      }
+    });
+    if (result.workspaces.length === 1) {
+      console.log(`Logged in to Switchyard. Scoped to workspace ${result.workspaces[0].slug}.`);
+    } else if (result.workspaces.length > 1) {
+      console.log(`Logged in to Switchyard. Token spans ${result.workspaces.length} workspaces:`);
+      for (const w of result.workspaces) console.log(`  • ${w.slug}`);
+    } else {
+      console.log('Logged in to Switchyard.');
+    }
+    console.log(`Saved to ${getConfigPath()}`);
+    console.log('Run `teamclaude service restart` if the server is running, or the pusher will pick it up on the next config reload.');
+  } catch (err) {
+    console.error(`Switchyard login failed: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 // ── server ──────────────────────────────────────────────────

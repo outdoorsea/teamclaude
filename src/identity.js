@@ -14,6 +14,7 @@
 // Provider is part of it too: a Codex account has no Anthropic UUID at all, so
 // without it one email's Claude and ChatGPT subscriptions compare as one account.
 
+import { isTokenRejection } from './oauth.js';
 import { providerOf } from './provider.js';
 
 /** Stable org discriminator for an account record: org UUID, else org name, else null. */
@@ -137,14 +138,6 @@ export function updateAccountEntry(prev, incoming) {
   return { ...prev, ...incoming, name: prev.name, id: prev.id };
 }
 
-/**
- * Short human label for an account's organization, for disambiguating two
- * entries that would otherwise share one email-derived display name.
- */
-export function orgLabel(acct) {
-  return acct.orgName || (acct.orgUuid ? acct.orgUuid.slice(0, 8) : 'org');
-}
-
 /** The email portion of a display name, stripping any " (org)" suffix. */
 export function emailOf(acct) {
   return (acct?.name || '').replace(/ \(.*\)$/, '');
@@ -177,6 +170,13 @@ export function matchAccounts(accounts, query, orgFilter) {
  * An explicit name is the caller's opt-in to importing without detection.
  */
 export function canUpsertOAuthAccount(profile, userNamed) {
+  // A token the upstream has REJECTED is dead, and --name must not override
+  // that. Importing it reports success and then 401s on every request, with
+  // nothing pointing back at the account that was already known to be bad.
+  // Only a definitive refusal counts: a 5xx, a timeout or a DNS failure says
+  // nothing about the token, and a healthy one must stay importable from a
+  // restricted network — which is what `userNamed` is for.
+  if (isTokenRejection(profile)) return false;
   return Boolean(
     userNamed
     || (profile && !profile.error && (profile.accountUuid || profile.email))
