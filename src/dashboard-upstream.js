@@ -879,6 +879,7 @@ const PAGE = `<!doctype html>
   var THEME_KEY = 'teamclaude-dashboard-theme';
   var POLL_MS = 5000;
   var timer = null;
+  var tick = null;
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
@@ -1390,11 +1391,15 @@ ${SHARED_HELPERS}
   }
 
   // One second, independent of the five-second poll: a countdown that only
-  // moved when the poll landed would sit still for seconds at a time.
-  setInterval(function () {
+  // moved when the poll landed would sit still for seconds at a time. Held by a
+  // handle like the poll is, so the key prompt stops both rather than leaving
+  // this one running behind it.
+  function retimeAll() {
     var nodes = document.querySelectorAll('[data-until]');
     for (var i = 0; i < nodes.length; i++) retime(nodes[i]);
-  }, 1000);
+  }
+  function startTick() { if (!tick) tick = setInterval(retimeAll, 1000); }
+  function stopTick() { if (tick) { clearInterval(tick); tick = null; } }
 
   function doControlAccount(name, spec, btn) {
     btn.disabled = true;
@@ -1436,12 +1441,18 @@ ${SHARED_HELPERS}
 
   function showKeybox() {
     if (timer) { clearInterval(timer); timer = null; }
+    stopTick();
     document.getElementById('app').style.display = 'none';
     document.getElementById('keybox').style.display = 'block';
     document.getElementById('key').focus();
   }
 
   function poll() {
+    // Nobody is looking at a hidden tab, and browsers throttle its timers
+    // unevenly anyway. Skipping the request rather than clearing the interval
+    // keeps one code path: becoming visible polls at once, so what comes back
+    // into view is current rather than however stale the last tick left it.
+    if (document.hidden) return;
     fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
@@ -1471,7 +1482,14 @@ ${SHARED_HELPERS}
   function start() {
     poll();
     if (!timer) timer = setInterval(poll, POLL_MS);
+    startTick();
   }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden || !timer) return;
+    poll();
+    retimeAll();
+  });
 
   document.getElementById('go').addEventListener('click', function () {
     var v = document.getElementById('key').value.trim();
