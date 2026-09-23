@@ -316,13 +316,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
           return;
         }
-        if (typeof body.account !== 'string' || !body.account.trim() || typeof body.priority !== 'number' || !Number.isFinite(body.priority)) {
+        // Either an exact number, or a relative move. A caller with buttons does
+        // not know the other accounts' priorities and sends `place` instead.
+        const hasPlace = body.place === 'first' || body.place === 'last';
+        const hasNumber = typeof body.priority === 'number' && Number.isFinite(body.priority);
+        if (typeof body.account !== 'string' || !body.account.trim() || (!hasPlace && !hasNumber)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'missing or invalid "account" / "priority"' }));
+          res.end(JSON.stringify({ ok: false, error: 'missing or invalid "account", and one of "priority" or "place" ("first"|"last")' }));
           return;
         }
         try {
-          const result = await hooks.setPriority(body.account.trim(), body.priority);
+          const result = await hooks.setPriority(body.account.trim(), hasPlace ? { place: body.place } : { priority: body.priority });
           console.log(`[TeamClaude] Set priority of "${result.name}" to ${result.priority} (manual)`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, ...result }));

@@ -518,25 +518,41 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
   // Account-level control from the dashboard: mutate config, save, and reload.
-  hooks.setPriority = async (accountName, priority) => {
-    const diskConfig = await loadOrCreateConfig();
-    const matches = matchAccounts(diskConfig.accounts, accountName);
-    if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
-    const account = matches[0];
-    account.priority = priority;
-    await saveConfig(diskConfig);
+  // `spec` is { priority } for an exact number, or { place: 'first'|'last' } to
+  // move the account relative to the others. The dashboard has buttons, not a
+  // number field, and does not know the other priorities — the server does.
+  // 'first' is one below the lowest, 'last' one above the highest.
+  hooks.setPriority = async (accountName, spec) => {
+    let result = null;
+    await atomicConfigUpdate(diskConfig => {
+      const matches = matchAccounts(diskConfig.accounts, accountName);
+      if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
+      const account = matches[0];
+      const priorities = (diskConfig.accounts || []).map(a => a.priority || 0);
+      const priority = spec?.place === 'first' ? Math.min(0, ...priorities) - 1
+        : spec?.place === 'last' ? Math.max(0, ...priorities) + 1
+        : spec?.priority;
+      if (!Number.isInteger(priority)) throw new Error('priority must be an integer, or place must be "first" or "last"');
+      account.priority = priority;
+      result = { name: account.name, priority };
+    });
     await reloadAccounts();
-    return { name: account.name, priority };
+    return result;
   };
+  // Written through atomicConfigUpdate, under the config lock, so a concurrent
+  // TUI edit is not clobbered and an updater that throws leaves the file as it
+  // was rather than half-applied.
   hooks.setDisabled = async (accountName, disabled) => {
-    const diskConfig = await loadOrCreateConfig();
-    const matches = matchAccounts(diskConfig.accounts, accountName);
-    if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
-    const account = matches[0];
-    if (disabled) account.disabled = true; else delete account.disabled;
-    await saveConfig(diskConfig);
+    let result = null;
+    await atomicConfigUpdate(diskConfig => {
+      const matches = matchAccounts(diskConfig.accounts, accountName);
+      if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
+      const account = matches[0];
+      if (disabled) account.disabled = true; else delete account.disabled;
+      result = { name: account.name, disabled: !!account.disabled };
+    });
     await reloadAccounts();
-    return { name: account.name, disabled: !!account.disabled };
+    return result;
   };
   hooks.logUpstreamError = ({ account, message, code, transient }) => {
     upstreamErrors.push({
