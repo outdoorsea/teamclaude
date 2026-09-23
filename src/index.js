@@ -6,6 +6,8 @@ import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { WorkContextStore } from './work-context.js';
+import { UsagePusher } from './usage-pusher.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -581,7 +583,75 @@ async function serverCommand() {
   }
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
+  // Resolve Switchyard usage-push settings from env/config. Env wins.
+  function getSwitchyardUsageConfig(cfg) {
+    const baseUrl = process.env.TEAMCLAUDE_SWITCHYARD_BASE_URL
+      || process.env.SWITCHYARD_BASE_URL
+      || cfg?.switchyard?.baseUrl
+      || null;
+    const apiKey = process.env.TEAMCLAUDE_SWITCHYARD_API_KEY
+      || process.env.SWITCHYARD_API_TOKEN
+      || cfg?.switchyard?.apiKey
+      || null;
+    const envSeconds = process.env.TEAMCLAUDE_SWITCHYARD_USAGE_INTERVAL_SECONDS;
+    const cfgSeconds = cfg?.switchyard?.usageIntervalSeconds;
+    const intervalSeconds = envSeconds != null ? Number(envSeconds)
+      : cfgSeconds != null ? Number(cfgSeconds)
+      : 300;
+    return { baseUrl, apiKey, intervalMs: intervalSeconds * 1000 };
+  }
+
+  // Work context store: maps Claude Code session ids to project/PRD/PR/bead
+  // context declared through the MCP server, and keeps a rolling usage ledger.
+  // --usage-log <file>, TEAMCLAUDE_USAGE_LOG, or config.usageLogPath.
+  const usageLogPath = argValue('--usage-log') || process.env.TEAMCLAUDE_USAGE_LOG || config.usageLogPath || null;
+  const workContextStore = new WorkContextStore({ usageLogPath });
+
+  // Rolling buffer of upstream errors so the dashboard can show whether a
+  // failure was TeamClaude-internal or a problem reaching the upstream.
+  const MAX_UPSTREAM_ERRORS = 50;
+  const upstreamErrors = [];
+  let usagePusher = null;
+
   hooks.reload = reloadAccounts;
+  hooks.workContextStore = workContextStore;
+
+  // Account-level control from the dashboard. Written through
+  // atomicConfigUpdate, like every other config mutation here: an updater that
+  // throws leaves the file untouched, so a bad name cannot half-apply.
+  hooks.setPriority = async (accountName, priority) => {
+    let result = null;
+    await atomicConfigUpdate(diskConfig => {
+      const matches = matchAccounts(diskConfig.accounts, accountName);
+      if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
+      matches[0].priority = priority;
+      result = { name: matches[0].name, priority };
+    });
+    await reloadAccounts();
+    return result;
+  };
+  hooks.setDisabled = async (accountName, disabled) => {
+    let result = null;
+    await atomicConfigUpdate(diskConfig => {
+      const matches = matchAccounts(diskConfig.accounts, accountName);
+      if (matches.length !== 1) throw new Error(`account "${accountName}" not found or ambiguous`);
+      const account = matches[0];
+      if (disabled) account.disabled = true; else delete account.disabled;
+      result = { name: account.name, disabled: !!account.disabled };
+    });
+    await reloadAccounts();
+    return result;
+  };
+  hooks.logUpstreamError = ({ account, message, code, transient }) => {
+    upstreamErrors.push({
+      timestamp: new Date().toISOString(),
+      account,
+      message,
+      code: code || null,
+      transient: !!transient,
+    });
+    if (upstreamErrors.length > MAX_UPSTREAM_ERRORS) upstreamErrors.shift();
+  };
   hooks.persistAccounts = () => atomicConfigUpdate(mergeAccountsOnto);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
@@ -592,6 +662,19 @@ async function serverCommand() {
     clients: clientUsage.export(),
     // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
     usageDimensions: dimensionUsage.export(),
+    switchyard: usagePusher?.getStatus() || {
+      enabled: false,
+      url: null,
+      intervalSeconds: 0,
+      running: false,
+      lastSuccessAt: null,
+      nextRunAt: null,
+      lastError: null,
+    },
+    contexts: {
+      active: workContextStore.activeContexts().length,
+    },
+    upstreamErrors: upstreamErrors.slice(-20),
     server: {
       version: serverVersion,
       versionLabel,
@@ -716,6 +799,10 @@ async function serverCommand() {
     apiKey: config.proxy?.apiKey,
   });
   warmer.start();
+
+  // Opt-in Switchyard usage push — a no-op when switchyard.usageUrl is unset.
+  usagePusher = new UsagePusher(workContextStore, getSwitchyardUsageConfig(config));
+  usagePusher.start();
 
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive

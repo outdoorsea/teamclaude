@@ -12,6 +12,7 @@ const execFileAsync = promisify(execFile);
 
 const DEFAULT_CREDENTIALS_PATH = '~/.claude/.credentials.json';
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+const KEYCHAIN_ORIGIN = `macOS Keychain (${KEYCHAIN_SERVICE})`;
 
 /** The login name whose Keychain item to prefer, or null where there isn't one. */
 function currentUsername() {
@@ -96,7 +97,9 @@ export async function importCredentials(filePath, {
     }
   }
 
+  let origin = useKeychain ? KEYCHAIN_ORIGIN : resolvedPath;
   if (!raw) {
+    origin = resolvedPath;
     try {
       raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
     } catch (err) {
@@ -106,6 +109,7 @@ export async function importCredentials(filePath, {
       // Keychain that could not be read at all is an error here.
       if (keychainBlank) {
         raw = keychainBlank;
+        origin = KEYCHAIN_ORIGIN;
       } else {
         const detail = keychainErr ? keychainErr.message : 'no item carried a token';
         throw new Error(`${err.message}; macOS Keychain lookup for "${KEYCHAIN_SERVICE}" also failed: ${detail}`);
@@ -124,6 +128,7 @@ export async function importCredentials(filePath, {
     ...(data.refreshTokenExpiresAt != null && { refreshTokenExpiresAt: data.refreshTokenExpiresAt }),
     subscriptionType: data.subscriptionType,
     rateLimitTier: data.rateLimitTier,
+    origin,
   };
 }
 
@@ -301,12 +306,15 @@ export async function fetchProfile(accessToken) {
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
+      // Carry the status alongside the message: callers must tell "this token is
+      // dead" (401/403) from "we could not reach the endpoint" (5xx, network),
+      // and parsing that back out of the string would be fragile.
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
     const data = await res.json();
     return normalizeProfile(data);
   } catch (err) {
-    return { error: err.message || String(err) };
+    return { error: err.message || String(err), status: null };
   }
 }
 
@@ -315,6 +323,15 @@ export async function fetchProfile(accessToken) {
 // carrying `scope.model.display_name`). Returns a bucket-shaped object
 // { utilization, resets_at } ready for normalizeUsageBucket, or null if absent.
 // The legacy top-level `seven_day_<model>` keys read null on current plans.
+/**
+ * Whether a failed fetchProfile proves the token is dead, as opposed to merely
+ * unreachable. Only the upstream saying "no" counts; a 5xx or a network error
+ * must not be read as a rejection, or a blip would discard a good account.
+ */
+export function isTokenRejection(profile) {
+  return profile?.status === 401 || profile?.status === 403;
+}
+
 export function findScopedWeeklyLimit(data, modelNamePattern) {
   const limits = Array.isArray(data?.limits) ? data.limits : [];
   const entry = limits.find((l) =>

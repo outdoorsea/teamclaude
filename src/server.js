@@ -561,6 +561,169 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Priority endpoint — set an account's rotation priority (lower = preferred).
+      // Body: {"account": "<name|email>", "priority": <number>}.
+      // Local control only; the auth/cross-origin gate above applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/priority') {
+        if (!hooks.setPriority) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'priority updates not supported' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}');
+        } catch (err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.account !== 'string' || !body.account.trim() || typeof body.priority !== 'number' || !Number.isFinite(body.priority)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or invalid "account" / "priority"' }));
+          return;
+        }
+        try {
+          const result = await hooks.setPriority(body.account.trim(), body.priority);
+          console.log(`[TeamClaude] Set priority of "${result.name}" to ${result.priority} (manual)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      // Enable/disable endpoint — exclude or re-include an account from rotation.
+      // Body: {"account": "<name|email>", "disabled": <true|false>}.
+      // Local control only; the auth/cross-origin gate above applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/disable') {
+        if (!hooks.setDisabled) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'enable/disable not supported' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}');
+        } catch (err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.account !== 'string' || !body.account.trim() || typeof body.disabled !== 'boolean') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or invalid "account" / "disabled"' }));
+          return;
+        }
+        try {
+          const result = await hooks.setDisabled(body.account.trim(), body.disabled);
+          console.log(`[TeamClaude] ${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}" (manual)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      // Work context endpoints — read/write the project/PRD/PR/bead context that
+      // the MCP server sets on behalf of Claude Code sessions. These are local
+      // control endpoints (no upstream calls) and use the same cross-origin gate
+      // as reload/switch.
+      if (req.url === '/teamclaude/context' || req.url.startsWith('/teamclaude/context?')) {
+        const store = hooks.workContextStore;
+        if (!store) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'work context store not available' }));
+          return;
+        }
+        if (req.method === 'GET') {
+          const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+          const sessionId = url.searchParams.get('session_id') || req.headers['x-claude-code-session-id'] || null;
+          const ctx = sessionId ? store.get(sessionId) : null;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, context: ctx }));
+          return;
+        }
+        if (req.method === 'POST') {
+          let body;
+          try {
+            body = JSON.parse(await readControlBody(req) || '{}');
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'invalid request body' }));
+            return;
+          }
+          const sessionId = body.session_id || req.headers['x-claude-code-session-id'] || null;
+          if (!sessionId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'missing session_id' }));
+            return;
+          }
+          let ctx;
+          if (body.action === 'release') {
+            ctx = store.release(sessionId);
+          } else if (body.action === 'claim') {
+            ctx = store.claim(sessionId, body);
+          } else {
+            ctx = store.setContext(sessionId, body);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, context: ctx }));
+          return;
+        }
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+        return;
+      }
+
+      if (req.url === '/teamclaude/contexts') {
+        const store = hooks.workContextStore;
+        if (!store) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'work context store not available' }));
+          return;
+        }
+        if (req.method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, contexts: store.activeContexts() }));
+          return;
+        }
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+        return;
+      }
+
+      if (req.url === '/teamclaude/usage') {
+        const store = hooks.workContextStore;
+        if (!store) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'work context store not available' }));
+          return;
+        }
+        if (req.method === 'GET') {
+          const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+          const groupBy = url.searchParams.get('group_by') || 'projectSlug';
+          const hours = Math.min(168, Math.max(1, parseInt(url.searchParams.get('hours') || '24', 10) || 24));
+          const filters = {};
+          if (url.searchParams.get('project_slug')) filters.projectSlug = url.searchParams.get('project_slug');
+          if (url.searchParams.get('prd_id')) filters.prdId = parseInt(url.searchParams.get('prd_id'), 10);
+          if (url.searchParams.get('bead_id')) filters.beadId = url.searchParams.get('bead_id');
+          const summary = store.usageSummary({ groupBy, hours, filters });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...summary }, null, 2));
+          return;
+        }
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+        return;
+      }
+
       // MCP management endpoint — the tool-shaped face of this control plane,
       // off unless proxy.mcp says otherwise. The gates above are the same ones
       // the other /teamclaude/ routes pass, with one addition: a config with no
@@ -1216,13 +1379,48 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage });
       usageRecorder.recordRequest();
 
+      // Switchyard work-context attribution rides the same hook, for the same
+      // reason the dimensions do. The context is declared once per session
+      // through the MCP server rather than carried on each request, so it is
+      // looked up by session id here and the tokens are booked against the
+      // bead/PRD the agent said it was working on. Composing onUsage keeps the
+      // response path untouched: nothing below this line knows about it.
+      const workContexts = hooks.workContextStore || null;
+      const workContext = workContexts && sessionId ? workContexts.get(sessionId) : null;
+      const baseOnUsage = usageRecorder.onUsage;
+      const onUsage = !workContext ? baseOnUsage : (inputTokens, outputTokens) => {
+        baseOnUsage?.(inputTokens, outputTokens);
+        workContexts.recordUsage({
+          timestamp: Date.now(),
+          sessionId,
+          // ctx.account is the chosen account's NAME, set when selection lands;
+          // before that, or on a refusal, it is a parenthesised reason string.
+          accountName: ctx?.account || '(unknown)',
+          accountIndex: (() => {
+            const i = accountManager.accounts.findIndex(a => a.name === ctx?.account);
+            return i === -1 ? null : i;
+          })(),
+          model: model || null,
+          inputTokens: inputTokens || 0,
+          outputTokens: outputTokens || 0,
+          tenantSlug: workContext.tenantSlug,
+          projectSlug: workContext.projectSlug,
+          projectId: workContext.projectId,
+          prdId: workContext.prdId,
+          prNumber: workContext.prNumber,
+          beadId: workContext.beadId,
+          agentRef: workContext.agentRef,
+          rigName: workContext.rigName,
+        });
+      };
+
       // The dimension headers are ours, not upstream's: they exist to label
       // traffic for this proxy. Forwarding them would leak an operator's
       // internal project and branch names to Anthropic for no benefit, so they
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
