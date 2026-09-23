@@ -318,6 +318,73 @@ export function uniqSorted(values) {
 // The request the switch button sends: POST /teamclaude/switch with the same
 // key the status poll uses. Pure, so the test suite can send exactly this
 // through a real proxy and prove the same-origin CSRF gate lets the page in.
+/**
+ * Accounts in draw order: the ones rotation can still reach first, disabled
+ * ones after them. Stable within each group, so the order the server sent —
+ * which is the rotation order — is preserved among the live accounts instead
+ * of being re-sorted into something that no longer means anything.
+ *
+ * A disabled account is still listed rather than hidden: it is a thing the
+ * operator turned off and has to be able to turn back on.
+ */
+export function orderAccounts(accounts) {
+  var live = [];
+  var off = [];
+  (accounts || []).forEach(function (a) { (a && a.disabled ? off : live).push(a); });
+  return live.concat(off);
+}
+
+/**
+ * When an account that cannot serve now is expected to be able to again, or
+ * null when nothing says it is held.
+ *
+ * Three things hold an account, and they clear at different times: an upstream
+ * 429 (rateLimitedUntil), an operator/proxy pause (pausedUntil), and a spent
+ * quota window, which clears at that window's own reset. The soonest of them is
+ * the answer, because the account is back the moment the last one lifts — and
+ * the reason is carried alongside so the page can say which clock it is.
+ *
+ * A window counts as spent at 100%, not at the switch threshold: crossing the
+ * threshold moves traffic elsewhere but the account can still serve, and a
+ * countdown on it would be telling the operator to wait for something that is
+ * not actually blocked.
+ */
+export function availabilityAt(account, now) {
+  var held = [];
+  if (account && account.rateLimitedUntil > now) held.push({ at: account.rateLimitedUntil, reason: 'upstream 429 hold' });
+  if (account && account.pausedUntil > now) held.push({ at: account.pausedUntil, reason: 'paused' });
+  var q = (account && account.quota) || {};
+  var windows = [
+    { use: q.unified5h, at: q.unified5hReset, label: '5h quota' },
+    { use: q.unified7d, at: q.unified7dReset, label: 'weekly quota' },
+    { use: q.unified7dSonnet, at: q.unified7dSonnetReset, label: 'weekly Sonnet quota' },
+    { use: q.unified7dFable, at: q.unified7dFableReset, label: 'weekly Fable quota' },
+  ];
+  windows.forEach(function (w) {
+    if (w.use != null && w.use >= 1 && w.at > now) held.push({ at: w.at, reason: w.label });
+  });
+  if (!held.length) return null;
+  return held.reduce(function (a, b) { return b.at < a.at ? b : a; });
+}
+
+/**
+ * A countdown, coarsening as it lengthens: seconds matter when the wait is
+ * nearly over and are noise when it is hours away, and a ticker that only ever
+ * changed its seconds digit would read as the only thing happening on the page.
+ */
+export function formatCountdown(ms) {
+  if (!(ms > 0)) return 'now';
+  var s = Math.floor(ms / 1000);
+  var d = Math.floor(s / 86400);
+  var h = Math.floor((s % 86400) / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm ' + sec + 's';
+  return sec + 's';
+}
+
 export function switchRequest(name, key) {
   return {
     url: '/teamclaude/switch',
@@ -538,7 +605,8 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, orderAccounts,
+  availabilityAt, formatCountdown, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -622,6 +690,19 @@ const PAGE = `<!doctype html>
   td.num, th.num { text-align: right; }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
+  .ticker { color: var(--warn); font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  #current .who { font-size: 16px; font-weight: 600; }
+  #current .row { margin-bottom: 2px; }
+  .ticker b { color: var(--text); font-weight: 600; }
+  /* A disabled account is drawn as a ghost of a card: it is still there, still
+     identifiable, and clearly not in play. The dimming is applied to the card's
+     CONTENTS rather than the card, because opacity on the card would create a
+     stacking context its children cannot escape — the enable button would fade
+     with everything else, and that button is the one thing here that must stay
+     legible and obviously clickable. */
+  .card.off { background: transparent; border-style: dashed; }
+  .card.off > *:not(.row) { opacity: .45; }
+  .card.off .row > *:not(.primary) { opacity: .45; }
   .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
   .act:hover { background: var(--accent); color: var(--bg); }
   .act:disabled { opacity: .5; cursor: default; }
@@ -684,6 +765,10 @@ const PAGE = `<!doctype html>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
       <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
+    </div>
+    <div id="currentWrap" style="display:none">
+      <h2>Current account</h2>
+      <div class="card" id="current"></div>
     </div>
     <h2>Accounts</h2>
     <div id="accounts"></div>
@@ -794,8 +879,46 @@ ${SHARED_HELPERS}
     return row;
   }
 
+  // The account traffic is on right now, called out above the full list. The
+  // summary line names it too, but in a sentence; an operator watching a
+  // rotation wants it where the eye lands, next to whether it is actually able
+  // to serve. Hidden rather than empty when nothing is current, so the heading
+  // never stands over a blank card.
+  function renderCurrent(s, currentAccounts) {
+    var wrap = document.getElementById('currentWrap');
+    var box = document.getElementById('current');
+    var names = currentAccounts
+      ? Object.keys(currentAccounts).map(function (k) { return currentAccounts[k]; })
+      : (s.currentAccount ? [s.currentAccount] : []);
+    var chosen = (s.accounts || []).filter(function (a) { return names.indexOf(a.name) !== -1; });
+    if (!chosen.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    box.textContent = '';
+    chosen.forEach(function (a) {
+      var row = el('div', 'row');
+      row.appendChild(el('span', 'who', a.name));
+      accountBadges(a, s.currentAccount, currentAccounts, null, s.switchThreshold, s.switchThresholds)
+        .forEach(function (badge) { row.appendChild(el('span', 'badge ' + badge.cls, badge.text)); });
+      box.appendChild(row);
+      if (a.unavailable) box.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+      var hold = availabilityAt(a, Date.now());
+      if (hold) {
+        var tick = el('div', 'ticker');
+        tick.setAttribute('data-until', String(hold.at));
+        tick.setAttribute('data-reason', hold.reason);
+        retime(tick);
+        box.appendChild(tick);
+      }
+      // Same line the card carries, composed the same way: accountTokens is a
+      // count, not a sentence, and rendering it raw put a bare "0" here.
+      var u = a.usage || {};
+      var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
+      box.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
+    });
+  }
+
   function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
-    var card = el('div', 'card');
+    var card = el('div', a.disabled ? 'card off' : 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
     var isCurrent = currentAccounts
@@ -813,7 +936,9 @@ ${SHARED_HELPERS}
     // Named ctl* deliberately: var is function-scoped, and this builder already
     // declares a "last" further down (the last-used string). A button named
     // last here is overwritten by that before any click can fire.
-    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+    // The "primary" class is what the ghosting rule spares: on a disabled card
+    // every other control dims with the rest of it, and the way back in does not.
+    var ctlDisable = el('button', a.disabled ? 'act primary' : 'act', a.disabled ? 'enable' : 'disable');
     ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
     head.appendChild(ctlDisable);
     if (!a.disabled) {
@@ -826,6 +951,17 @@ ${SHARED_HELPERS}
     }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    // A held account gets a live countdown to the moment it can serve again.
+    // The timestamp is put on the node so the one-second tick can retime it
+    // without re-rendering the card, which would fight the five-second poll.
+    var hold = availabilityAt(a, Date.now());
+    if (hold) {
+      var tick = el('div', 'ticker');
+      tick.setAttribute('data-until', String(hold.at));
+      tick.setAttribute('data-reason', hold.reason);
+      retime(tick);
+      card.appendChild(tick);
+    }
     var q = a.quota || {};
     if (q.unified5h != null || q.unified7d != null) {
       card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
@@ -1089,9 +1225,10 @@ ${SHARED_HELPERS}
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
+    renderCurrent(s, currentAccounts);
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
+    orderAccounts(s.accounts).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
@@ -1129,6 +1266,32 @@ ${SHARED_HELPERS}
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
   }
+
+  // Rewrite one countdown from its stored deadline. Reading the deadline off
+  // the node rather than closing over it means the tick does not care which
+  // render produced the element, so a poll landing mid-second cannot leave a
+  // stale closure updating a node that is no longer on the page.
+  function retime(node) {
+    var until = Number(node.getAttribute('data-until'));
+    var reason = node.getAttribute('data-reason') || 'held';
+    var left = until - Date.now();
+    if (left <= 0) {
+      node.textContent = '';
+      node.appendChild(document.createTextNode(reason + ' — '));
+      node.appendChild(el('b', '', 'available now'));
+      return;
+    }
+    node.textContent = '';
+    node.appendChild(document.createTextNode(reason + ' — back in '));
+    node.appendChild(el('b', '', formatCountdown(left)));
+  }
+
+  // One second, independent of the five-second poll: a countdown that only
+  // moved when the poll landed would sit still for seconds at a time.
+  setInterval(function () {
+    var nodes = document.querySelectorAll('[data-until]');
+    for (var i = 0; i < nodes.length; i++) retime(nodes[i]);
+  }, 1000);
 
   function doControlAccount(name, spec, btn) {
     btn.disabled = true;
