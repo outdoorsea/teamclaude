@@ -11,7 +11,11 @@ import { createProxyServer, resolveUpgradeAuth } from '../src/server.js';
 // configured upstream: no pooled credential rides along (relayUpgrade forwards
 // the client's own headers), but the operator's host and address do.
 
-const PROXY = { apiKey: 'shared-key', clientKeys: [{ name: 'alice', key: 'alice-key' }] };
+// Upstream's fixture also carries `clientKeys: [{ name: 'alice', ... }]` and
+// asserts the matched name comes back as `client`. That feature is not in
+// this fork (see resolveClientAuth in server.js), so the shared key is the
+// only one that authenticates and `client` is always null.
+const PROXY = { apiKey: 'shared-key' };
 const sock = (remoteAddress) => ({ remoteAddress });
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 
@@ -19,7 +23,6 @@ test('the upgrade gate answers like the other two', () => {
   const remote = sock('203.0.113.7');
   assert.deepEqual(resolveUpgradeAuth({ headers: {} }, remote, PROXY), { ok: false, client: null });
   assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'shared-key' } }, remote, PROXY), { ok: true, client: null });
-  assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'alice-key' } }, remote, PROXY), { ok: true, client: 'alice' });
   assert.deepEqual(resolveUpgradeAuth({ headers: { 'x-api-key': 'wrong' } }, remote, PROXY), { ok: false, client: null });
   // Loopback is exempt, as it is on the HTTP and CONNECT gates, so a local
   // `teamclaude attach` keeps working with no key.
@@ -45,7 +48,7 @@ test('the loopback exemption is refused to a web page: foreign Origin or Host', 
   // A malformed Origin cannot be trusted either way; refuse.
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: '127.0.0.1:3456', origin: 'not a url' } }, local, PROXY), refused);
   // A valid key passes regardless of Origin or Host, and a bound LAN host is local.
-  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'attacker.example', origin: 'https://attacker.example', 'x-api-key': 'alice-key' } }, local, PROXY), { ok: true, client: 'alice' });
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'attacker.example', origin: 'https://attacker.example', 'x-api-key': 'shared-key' } }, local, PROXY), exempt);
   assert.deepEqual(resolveUpgradeAuth({ headers: { host: '192.168.1.5:3456' } }, local, { ...PROXY, host: '192.168.1.5' }), exempt);
 });
 
@@ -58,10 +61,10 @@ test('a key offered in Sec-WebSocket-Protocol is NOT accepted', () => {
   // trade, and this pins it.
   const remote = sock('203.0.113.7');
   assert.deepEqual(
-    resolveUpgradeAuth({ headers: { 'sec-websocket-protocol': 'teamclaude, alice-key' } }, remote, PROXY),
+    resolveUpgradeAuth({ headers: { 'sec-websocket-protocol': 'teamclaude, shared-key' } }, remote, PROXY),
     { ok: false, client: null });
   assert.deepEqual(
-    resolveUpgradeAuth({ headers: { 'sec-websocket-protocol': 'alice-key' } }, remote, PROXY),
+    resolveUpgradeAuth({ headers: { 'sec-websocket-protocol': 'shared-key' } }, remote, PROXY),
     { ok: false, client: null });
 });
 
@@ -103,7 +106,7 @@ test('an unauthorized handshake is refused on the socket, not silently held', as
     assert.match(refused, /^HTTP\/1\.1 401 Unauthorized/, 'refused, and told so');
     assert.equal(relayed, false, 'and never reached the upstream');
 
-    const allowed = await handshake('alice-key');
+    const allowed = await handshake('shared-key');
     // The stub upstream never completes the handshake, so `allowed` is empty —
     // asserting it lacks "401" would pass vacuously. Reaching the upstream is
     // the real oracle, and it is what a broken gate would prevent.
