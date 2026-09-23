@@ -657,6 +657,10 @@ async function serverCommand() {
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  // The dashboard's "Probe quotas" button, and the web equivalent of the TUI's
+  // `p` key. Present whether or not the periodic probe is enabled: a one-shot
+  // read is useful precisely when quotaProbeSeconds is 0.
+  hooks.probeQuota = () => prober?.probeAll();
   prober.start();
 
   // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
