@@ -3,6 +3,7 @@ import { importCredentials, fetchProfile } from './oauth.js';
 import { sameIdentity } from './identity.js';
 import { planAccountUpsert, applyAccountPlan } from './account-upsert.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { safeLine } from './safe-text.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 

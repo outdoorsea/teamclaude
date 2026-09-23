@@ -14,6 +14,7 @@ import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { serveDashboard } from './dashboard.js';
+import { safeLine } from './safe-text.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -75,6 +76,26 @@ export function safeKeyEqual(a, b) {
   return timingSafeEqual(ba, bb);
 }
 
+/**
+ * Whether a presented key authenticates the caller, in the `{ ok, client }`
+ * shape the loopback and WebSocket-upgrade gates below expect.
+ *
+ * Upstream also matches named per-client keys here (`proxy.clientKeys`), which
+ * is how it attributes a request to a person. This fork has only the shared
+ * key, so `client` is always null — the shape is kept so the gates read the
+ * same as upstream's and a later clientKeys port is a change to this function
+ * alone.
+ *
+ * @param {any} proxyConfig
+ * @param {unknown} presented
+ * @returns {{ ok: boolean, client: string|null }}
+ */
+export function resolveClientAuth(proxyConfig, presented) {
+  const shared = proxyConfig?.apiKey;
+  if (!shared) return { ok: true, client: null };
+  return { ok: safeKeyEqual(presented, shared), client: null };
+}
+
 // True if a socket's remote address is loopback — the proxy-key gate exempts
 // localhost on both the HTTP and CONNECT paths.
 export function isLoopbackAddr(addr) {
@@ -83,7 +104,6 @@ export function isLoopbackAddr(addr) {
 
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
-  const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -95,8 +115,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     try {
       // Auth check — skip for localhost connections.
       const clientKey = req.headers['x-api-key'];
+      const auth = resolveClientAuth(config.proxy, clientKey);
       const isLocal = isLoopbackAddr(req.socket.remoteAddress);
-      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
+      if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -723,7 +744,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request path must not contain dot-segments' } }));
-        recordEarlyOutcome(accountManager, sessionId, req.url, true);
+        // Upstream also books this refusal against the session's health streak
+        // (recordEarlyOutcome). That subsystem — classificationPath,
+        // isCompletionPath, accountManager.recordOutcome* — is not in this fork,
+        // so the refusal itself is the whole of the fix here.
         return;
       }
 
