@@ -314,3 +314,34 @@ function parseTs(value) {
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? null : parsed;
 }
+
+// ── Vendored from upstream for the dashboard port ─────────────────────
+// dashboard-upstream.js needs these two. The rest of upstream's
+// status-renderer pulls in model.js/config-ops.js surfaces this fork does
+// not have, so only what the page reads is taken.
+
+// Why an account is out of rotation, in the operator's terms. Reading
+// `unifiedStatus: allowed` next to an account that refuses everything used to
+// leave no way to tell whether the refusal was upstream's or the proxy's own
+// threshold policy (#166); this says which.
+export const UNAVAILABLE_TEXT = {
+  disabled: 'disabled by operator',
+  throttled: 'upstream 429 hold',
+  exhausted: 'marked exhausted',
+  error: 'account error (see logs)',
+  'upstream-rejected': 'upstream reports quota rejected',
+  quota: 'local switch threshold reached',
+  capped: 'account usage cap reached (maxUsage)',
+  'advisor-capped': "advisor model's usage cap reached (maxUsage)",
+  entitlement: 'upstream refused this account for the organization (cooldown)',
+  route: 'no route allows this account',
+  'advisor-quota': "advisor model's weekly bucket spent",
+  'advisor-route': 'no route allows the advisor model',
+};
+
+// How long a reset-credit reading is worth showing. Nothing refreshes the count
+// but the usage probe, and the probe is off by default, so a credit that was
+// redeemed or expired would otherwise stay on screen indefinitely. A week is the
+// longest Codex window: past it, every window the credit could have reset has
+// reset on its own, and the reading describes a situation that is gone.
+export const RESET_CREDIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;

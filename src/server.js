@@ -14,6 +14,7 @@ import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { serveDashboard } from './dashboard.js';
+import { renderDashboardHtml, dashboardCsp } from './dashboard-upstream.js';
 import { safeLine } from './safe-text.js';
 
 
@@ -445,6 +446,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       const path = req.url || '/';
       if (path === '/dashboard' || path.startsWith('/dashboard/')) {
         serveDashboard(req, res);
+        return;
+      }
+
+      // Upstream's dashboard, served in parallel at its own route so the two
+      // can be compared against one live server before either is chosen.
+      // The page carries no data: its script fetches /teamclaude/status, which
+      // stays behind the gate, so the asset itself needs no key (a browser
+      // address bar cannot send x-api-key).
+      if (req.method === 'GET' && path === '/teamclaude/dashboard') {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Content-Security-Policy': dashboardCsp(),
+          'X-Content-Type-Options': 'nosniff',
+        });
+        res.end(renderDashboardHtml());
         return;
       }
 
