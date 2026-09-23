@@ -342,6 +342,10 @@ async function serverCommand() {
   // Opt-in Switchyard usage push (config.switchyard.usageUrl, default null = off).
   let usagePusher = null;
   const serverStartedAt = Date.now();
+  // Read once here, not per request: `teamclaude update` swaps package.json on
+  // disk while this process keeps running the old code, and status must report
+  // what is running, not what is installed.
+  const serverVersion = currentVersion();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -465,7 +469,8 @@ async function serverCommand() {
 
   // In headless mode, wire activity-log writes directly via hooks + console.
   if (!tui && activityLogPath) {
-    const aStream = createWriteStream(activityLogPath, { flags: 'a' });
+    // 0600, matching the request log and the config (see tui.js for why).
+    const aStream = createWriteStream(activityLogPath, { flags: 'a', mode: 0o600 });
     aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
     const writeActivity = msg => {
@@ -550,6 +555,7 @@ async function serverCommand() {
     // per-request gate in server.js picks it up.
     blockedModels: [...(config.blockedModels || [])],
     server: {
+      version: serverVersion,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
@@ -784,7 +790,7 @@ async function loginCommand() {
 }
 
 async function loginApiCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -796,15 +802,20 @@ async function loginApiCommand() {
     process.exit(1);
   }
 
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    name = `api-${n}`;
-  }
-
-  config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
-  await saveConfig(config);
+  // The prompt above waits on the user for as long as they take, and a running
+  // server may have rotated an OAuth account's refresh token on disk meanwhile.
+  // Saving the copy loaded before the prompt would put the dead token back and
+  // lose that account on its next restart, so the row is added to a fresh read.
+  const config = await atomicConfigUpdate(disk => {
+    if (!name) {
+      const n = disk.accounts.filter(a => a.name.startsWith('api-')).length + 1;
+      name = `api-${n}`;
+    }
+    disk.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+  });
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 async function loginOAuthCommand() {
@@ -852,10 +863,17 @@ async function envCommand() {
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
-  const lines = buildClaudeEnvLines({
-    port, useMitm, caPath, holdSeconds: config.holdSeconds,
-    account, proxyApiKey: config.proxy?.apiKey || '',
-  });
+  let lines;
+  try {
+    lines = buildClaudeEnvLines({
+      port, useMitm, caPath, holdSeconds: config.holdSeconds,
+      account, proxyApiKey: config.proxy?.apiKey || '',
+    });
+  } catch (err) {
+    // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
+    process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
+    process.exit(1);
+  }
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
@@ -999,6 +1017,20 @@ async function runCommand() {
 
 // ── status ──────────────────────────────────────────────────
 
+// process.stdout.write is asynchronous when stdout is a pipe, so a write that
+// is followed by process.exit loses whatever has not reached the pipe yet: on
+// macOS a 15 KB status came out as its first 512 bytes through `| jq`. This
+// resolves once the bytes are handed off. A reader that quits early (`| head`)
+// raises EPIPE, which console.log swallows; the listener keeps that behaviour.
+function writeStdout(text) {
+  return new Promise(resolve => {
+    process.stdout.write(text, err => {
+      if (err) process.stdout.once('error', () => {});
+      resolve();
+    });
+  });
+}
+
 async function statusCommand() {
   const config = await loadOrCreateConfig();
   const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
@@ -1011,10 +1043,10 @@ async function statusCommand() {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
     if (json) {
-      console.log(JSON.stringify(data, null, 2));
+      await writeStdout(`${JSON.stringify(data, null, 2)}\n`);
       return;
     }
-    console.log(renderStatus(data, { color }));
+    await writeStdout(`${renderStatus(data, { color })}\n`);
   } catch (err) {
     console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
     console.error('Is the server running? Start with: teamclaude server');

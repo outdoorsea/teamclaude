@@ -252,3 +252,18 @@ test('an unreachable profile endpoint still imports', async () => {
   assert.equal(config.accounts.length, 1);
   assert.equal(calls.added.length, 1);
 });
+
+// Node's setInterval takes a 32-bit millisecond delay; an interval past
+// 2,147,483 s overflows it and the probe fires every millisecond instead.
+test('a probe interval over seven days is refused, not scheduled', async () => {
+  const { tui, config } = makeTUI();
+  config.quotaProbeSeconds = 300;
+  await tui._doSetProbe('2147484');
+  assert.equal(config.quotaProbeSeconds, 300);
+  assert.ok(tui.log.some(l => /at most 604800s/.test(l.msg)), 'the refusal is logged');
+  assert.equal(tui.mode, 'settings');
+  // The ceiling itself is accepted.
+  await tui._doSetProbe('604800');
+  assert.equal(config.quotaProbeSeconds, 604800);
+});
+

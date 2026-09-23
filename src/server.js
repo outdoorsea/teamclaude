@@ -1,7 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, writeSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureCerts, createConnectHandler } from './mitm.js';
@@ -14,6 +14,8 @@ import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { serveDashboard } from './dashboard.js';
+import { renderDashboardHtml, dashboardCsp } from './dashboard-upstream.js';
+import { safeLine } from './safe-text.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -22,6 +24,33 @@ export const HOP_BY_HOP_HEADERS = new Set([
 ]);
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
+
+/**
+ * Does the request path carry a dot-segment (`.` or `..`, in any percent-encoded
+ * spelling, on either slash)?
+ *
+ * Every path classification in the listener — the Codex pool, the
+ * client-credential relay, the `/tc-acct/` pin — is a prefix test on the path
+ * AS SENT, while the upstream URL is normalised afterwards by `new URL()` and
+ * fetch. So `/backend-api/codex/../conversations` classifies as Codex and
+ * reaches chatgpt.com as `/backend-api/conversations`, pooled token attached;
+ * `/v1/messages/../../api/oauth/profile` does not start with `/api/oauth/`,
+ * takes the pool path, and reaches the profile endpoint with a rotated token —
+ * the exact thing the relay exists to prevent for the literal path. Backslash
+ * counts because the URL parser treats it as a slash for http(s). No client of
+ * ours ever sends one; refusing the request is the whole fix.
+ */
+export function hasDotSegment(url) {
+  const path = String(url || '').split('?')[0].split('#')[0];
+  for (const seg of path.split(/[\/\\]/)) {
+    let s = seg;
+    // An undecodable segment (`%`) is compared as sent: the URL parser leaves
+    // it alone too, so it cannot become a dot-segment upstream.
+    try { s = decodeURIComponent(seg); } catch { /* keep raw */ }
+    if (s === '.' || s === '..') return true;
+  }
+  return false;
+}
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
 // on the SAME account) before surfacing a 429 + retry-after to the client. A
@@ -48,6 +77,26 @@ export function safeKeyEqual(a, b) {
   return timingSafeEqual(ba, bb);
 }
 
+/**
+ * Whether a presented key authenticates the caller, in the `{ ok, client }`
+ * shape the loopback and WebSocket-upgrade gates below expect.
+ *
+ * Upstream also matches named per-client keys here (`proxy.clientKeys`), which
+ * is how it attributes a request to a person. This fork has only the shared
+ * key, so `client` is always null — the shape is kept so the gates read the
+ * same as upstream's and a later clientKeys port is a change to this function
+ * alone.
+ *
+ * @param {any} proxyConfig
+ * @param {unknown} presented
+ * @returns {{ ok: boolean, client: string|null }}
+ */
+export function resolveClientAuth(proxyConfig, presented) {
+  const shared = proxyConfig?.apiKey;
+  if (!shared) return { ok: true, client: null };
+  return { ok: safeKeyEqual(presented, shared), client: null };
+}
+
 // True if a socket's remote address is loopback — the proxy-key gate exempts
 // localhost on both the HTTP and CONNECT paths.
 export function isLoopbackAddr(addr) {
@@ -56,7 +105,6 @@ export function isLoopbackAddr(addr) {
 
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
-  const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -68,8 +116,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     try {
       // Auth check — skip for localhost connections.
       const clientKey = req.headers['x-api-key'];
+      const auth = resolveClientAuth(config.proxy, clientKey);
       const isLocal = isLoopbackAddr(req.socket.remoteAddress);
-      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
+      if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -92,8 +141,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // this costs legitimate callers nothing. Deliberately not a content-type
       // requirement, which would also close the hole but would break the
       // documented `curl -X POST .../teamclaude/reload` that sends no body.
-      if (req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')
-          && !isSameOriginControlRequest(req)) {
+      const crossOrigin = !isSameOriginControlRequest(req);
+      if (crossOrigin && req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: false,
@@ -106,7 +155,45 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // proxying plain HTTP to some host. Account logic is only for hosts we
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
       // this way); forward anything else transparently instead of hijacking it.
+      // Dispatched BEFORE the loopback-only checks below: a page cannot make a
+      // browser emit an absolute-form request line, the relay injects no fleet
+      // credential, and its Host header names the TARGET, not this proxy.
       if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+
+      // A request admitted ONLY by the loopback exemption — no valid key — is
+      // held to two more conditions. Both target the same actor: a web page in
+      // the operator's browser, whose requests are loopback-sourced too. A
+      // caller that presented a valid key has proven itself and skips both.
+      if (!auth.ok) {
+        // Cross-origin, for every method and path this time. The control-plane
+        // gate above covers its mutations, but the same no-cors trick reaches
+        // POST /v1/messages, where the proxy injects a fleet credential (a quota
+        // drain, with prompt content booked to the operator), and a GET of
+        // /teamclaude/status is unreadable to the page only for as long as no
+        // CORS header ever leaks. Same browser-set headers, same zero cost to
+        // curl, the CLI and Node clients, which send neither.
+        if (crossOrigin) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'permission_error', message: 'cross-origin request refused: a web page cannot use the proxy without a key' },
+          }));
+          return;
+        }
+        // DNS rebinding. A page at attacker.example whose name flips to
+        // 127.0.0.1 sends requests that are loopback-sourced AND same-origin as
+        // far as the browser can tell, and it can read the answers. What it
+        // cannot forge is the Host header, which the browser derives from its
+        // own URL bar — so a key-less loopback request must name this machine.
+        if (!isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'permission_error', message: 'request refused: the Host header does not name this proxy' },
+          }));
+          return;
+        }
+      }
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
@@ -362,9 +449,28 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // Upstream's dashboard, served in parallel at its own route so the two
+      // can be compared against one live server before either is chosen.
+      // The page carries no data: its script fetches /teamclaude/status, which
+      // stays behind the gate, so the asset itself needs no key (a browser
+      // address bar cannot send x-api-key).
+      if (req.method === 'GET' && path === '/teamclaude/dashboard') {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Content-Security-Policy': dashboardCsp(),
+          'X-Content-Type-Options': 'nosniff',
+        });
+        res.end(renderDashboardHtml());
+        return;
+      }
+
       return forward(req, res);
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      reportFailure('[TeamClaude] Unhandled error:', err);
+      // The window above throws for real: `getStatusExtra` is a hook the
+      // application installs, and reload/switch reach the account manager.
+      answerUnhandled(res);
     }
   };
 
@@ -393,7 +499,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
   // same relayUpgrade onto its own terminating server in mitm.js).
-  server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+  server.on('upgrade', (req, socket, head) => {
+    // The upgrade handshake never reaches requestHandler, so it does not
+    // inherit the key gate above — it has to ask for itself. Without this a
+    // WebSocket handshake is an unauthenticated relay to `upstream`: the
+    // handshake carries no pooled credential (relayUpgrade forwards the
+    // client's own headers), so it is not a way to spend the fleet's quota,
+    // but it is a way to reach the upstream on this host's address and
+    // bandwidth. A deployment on a public hostname hands that to anyone.
+    if (!resolveUpgradeAuth(req, socket, config.proxy).ok) {
+      // Logged as well as answered: a WebSocket client discards the status
+      // line, so the 401 alone leaves an operator with a channel that is
+      // silently dead — the same shape as the outage this gate could cause if
+      // a client turns out not to send the key.
+      console.log(`[TeamClaude] WebSocket upgrade refused (no proxy key) from ${safeLine(socket?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
+      try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+      socket.destroy();
+      return;
+    }
+    relayUpgrade(req, socket, head, upstream, sx);
+  });
 
   return server;
 }
@@ -426,6 +551,51 @@ export function isSameOriginControlRequest(req) {
   const proto = req.headers['x-forwarded-proto']
     || (req.socket?.encrypted ? 'https' : 'http');
   return origin === `${proto}://${host}`;
+}
+
+// Names a browser can reach this machine by. `::ffff:127.0.0.1` is how a
+// dual-stack listener reports loopback and is accepted for symmetry with
+// isLoopbackAddr, though no browser writes it in a URL.
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '::ffff:127.0.0.1']);
+// Binding to a wildcard says nothing about what name reaches us, so it does
+// not widen the set.
+const WILDCARD_BINDS = new Set(['0.0.0.0', '::', '']);
+
+// The hostname part of a Host header (or a bind address): port stripped, IPv6
+// brackets removed, lowercased. null when the value cannot be one.
+function hostnameOf(host) {
+  const h = String(host).trim().toLowerCase();
+  if (h.startsWith('[')) {
+    const end = h.indexOf(']');
+    return end < 0 ? null : h.slice(1, end);
+  }
+  // A bare IPv6 address (how config.proxy.host spells one) has several colons
+  // and no port to strip; a `name:port` has exactly one.
+  const colon = h.indexOf(':');
+  if (colon >= 0 && h.indexOf(':', colon + 1) >= 0) return h;
+  return colon >= 0 ? h.slice(0, colon) : h;
+}
+
+/**
+ * Whether a request's Host header names this proxy, for the DNS-rebinding
+ * check on key-less loopback requests.
+ *
+ * Accepted: localhost, 127.0.0.1, ::1 (bracketed or not), and the address the
+ * proxy is bound to (`config.proxy.host`) unless that is a wildcard. Port and
+ * case are ignored.
+ *
+ * A MISSING Host header is accepted. Only an HTTP/1.0 client can omit it (Node
+ * rejects an HTTP/1.1 request without one before this code runs), and no
+ * browser speaks HTTP/1.0 — while a hand-rolled local tool might. Refusing it
+ * would break that tool without closing anything.
+ */
+export function isLocalHostHeader(host, bindHost = null) {
+  if (host == null || host === '') return true;
+  const name = hostnameOf(host);
+  if (name == null) return false;
+  if (LOCAL_HOSTNAMES.has(name)) return true;
+  const bound = typeof bindHost === 'string' ? hostnameOf(bindHost) : null;
+  return bound != null && !WILDCARD_BINDS.has(bound) && bound === name;
 }
 
 // Read a control-endpoint body as text. Capped, unlike the proxied request path:
@@ -481,6 +651,30 @@ export function resolveAccountPin(accountManager, token) {
   return null;
 }
 
+/**
+ * What actually went wrong on a failed connect, as a string worth printing.
+ *
+ * Node's happy-eyeballs dialer (`autoSelectFamily`, on by default across the
+ * versions this package supports; `package.json` declares `node >=20`, measured
+ * here on 24) reports a connect where every address failed as an AggregateError.
+ * Node builds that error with an empty `message`; the per-address reasons are in
+ * `.errors`. Any multi-address host reaches this, and the upstream is one, so
+ * `err.message` prints nothing for the failure operators most need to read.
+ *
+ * Looked for one level down as well, because `TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH`
+ * routes through global fetch, which wraps the same failure in a TypeError whose
+ * own message is the equally unhelpful "fetch failed".
+ *
+ * The `err.message` fallback is required: with `autoSelectFamily` off, and on
+ * every single-address failure, the reason arrives as a plain Error in
+ * `message`. It also covers a wrapper whose `.cause` carries no reasons.
+ */
+export function describeConnectError(err) {
+  const reasons = (e) => (Array.isArray(e?.errors) ? e.errors.map(c => c?.message).filter(Boolean) : []);
+  const own = reasons(err);
+  return (own.length ? own : reasons(err?.cause)).join('; ') || err?.message;
+}
+
 // Paths that must reach upstream with the client's own credential (never a
 // rotated account token): the Remote Control channel and attachment transfers.
 // teamclaude applies its account logic (rotation, exhaustion, token injection)
@@ -519,7 +713,7 @@ export function relayHttpForward(req, res) {
     upstreamRes.pipe(res);
   });
   upstreamReq.on('error', (err) => {
-    console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, err.message);
+    console.error(`[TeamClaude] HTTP forward to ${target.host} failed:`, describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -530,7 +724,16 @@ export function relayHttpForward(req, res) {
   else req.pipe(upstreamReq);
 }
 
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
+// Paths relayed with the CLIENT's own credential, never a rotated account token.
+// Everything under /api/oauth/ is the client's identity/control plane — profile
+// ("who am I"), file uploads, and whatever Claude Code adds next — not inference.
+// Injecting a fleet token here makes Claude Code believe it IS the rotated
+// account: the cached oauthAccount profile gets overwritten with a stranger's
+// identity, the Claude-in-Chrome extension refuses to pair ("token belongs to a
+// different account than the one you're logged in as"), Remote Control binds to
+// the wrong account, and artifacts get published under it. Observed on a live
+// fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
 /**
  * Build the core proxy request listener — buffer the body, then forward with
@@ -542,7 +745,29 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
   let counter = 0;
   return async (req, res) => {
+    // The activity entry this request opened, while it is still open. Every
+    // consumer holds the row until it is told the request ended, so exactly one
+    // path must close it. Each closing site clears this first, which is how the
+    // outer catch tells an entry it still has to account for from one that is
+    // already closed.
+    let openEntry = null;
     try {
+      // Refused before any path-prefix classification below, so each of those
+      // sees the path upstream will see (see hasDotSegment). Logged like the
+      // unknown-pin 404: an operator should see a client probing the boundary.
+      if (hasDotSegment(req.url)) {
+        const reqId = ++counter;
+        const sessionId = req.headers['x-claude-code-session-id'] || null;
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request path must not contain dot-segments' } }));
+        // Upstream also books this refusal against the session's health streak
+        // (recordEarlyOutcome). That subsystem — classificationPath,
+        // isCompletionPath, accountManager.recordOutcome* — is not in this fork,
+        // so the refusal itself is the whole of the fix here.
+        return;
+      }
+
       // Claude Code's telemetry (`/api/event_logging/*`) is high-volume noise in
       // the activity log. `config.eventLogging` (read live so the TUI toggle takes
       // effect immediately): 'show' forwards + displays; 'hide' (default) forwards
@@ -563,8 +788,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // rather than per-account: it is a property of the connection, and this is
       // the one path every request takes, MITM included.
       if (egress?.enabled()) {
-        const state = await egress.waitUntilPinned({ isAborted: () => res.destroyed });
-        if (res.destroyed) return;
+        const state = await egress.waitUntilPinned({ isAborted: () => clientGone(res) });
+        if (clientGone(res)) return;
         if (!state.ok) {
           res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
           res.end(JSON.stringify({
@@ -604,14 +829,23 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // The token runs to the next '/', which also begins the real request path.
       const tokenEnd = afterPrefix == null ? -1 : afterPrefix.indexOf('/');
       if (tokenEnd > 0) {
-        const token = decodeURIComponent(afterPrefix.slice(0, tokenEnd));
-        pinnedIndex = resolveAccountPin(accountManager, token);
+        // The escaping of this segment is the CLIENT's, so a malformed one
+        // ("/tc-acct/%/v1/messages") makes decodeURIComponent throw URIError.
+        // That is an ordinary bad request, not an internal error: decode
+        // defensively and fall through to the unknown-pin 404 below, which is
+        // what a pin nobody can resolve already means. An undecodable token is
+        // reported as it arrived, since there is no decoded form to name.
+        const raw = afterPrefix.slice(0, tokenEnd);
+        let token = null;
+        try { token = decodeURIComponent(raw); } catch { token = null; }
+        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
+          const shown = token ?? raw;
           const reqId = ++counter;
           const sessionId = req.headers['x-claude-code-session-id'] || null;
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
@@ -640,7 +874,15 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
-      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      if (!hideActivity) {
+        // Marked open BEFORE the hook runs. The shipped TUI hook registers its
+        // row and then renders, and the render can rethrow, so a hook that
+        // throws part way through has already opened a row that something must
+        // close. The cost of this order is one spurious close if the hook threw
+        // before registering anything, which every consumer already tolerates.
+        openEntry = { reqId, sessionId };
+        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      }
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -674,6 +916,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").` } }));
         }
+        openEntry = null;   // this path owns the close below; the outer catch must not repeat it
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
         return;
       }
@@ -688,19 +931,134 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
         ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
+        // Same rule as the two outer catches: a recovery path does not report
+        // through a console that may be the thing that failed. Here it also
+        // decides which error gets reported at all, since a throw from the
+        // report would carry the render failure outward in place of this one.
+        reportFailure('[TeamClaude] Unhandled error:', err);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
         accountManager.endSession(sessionId);
+        // Cleared BEFORE the hook, because the hook can throw: leaving the entry
+        // marked open would send the outer catch to call that same throwing hook
+        // a second time for one request.
+        openEntry = null;
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      reportFailure('[TeamClaude] Unhandled error:', err);
+      // Close the activity entry. Only the inner path has a `finally`, so a
+      // throw above it opens a row that nothing else will ever close, and every
+      // consumer holds an open row indefinitely: the TUI keeps it in `active`
+      // and never idles its animation, a headless consumer's in-flight count
+      // grows by one. `for await (const chunk of req)` rejects when a client
+      // cancels mid-body, which Ctrl+C in Claude Code does, on a daemon that
+      // runs for weeks.
+      if (openEntry) {
+        // 499 when nothing was sent and nothing will be, either because the
+        // client is gone or because the response is past the point of saying
+        // anything; 502 is what the answer below is about to write.
+        const status = res.headersSent || clientGone(res) ? 499 : 502;
+        const entry = openEntry;
+        openEntry = null;
+        // Guarded, because the throw that landed here may be this hook. Escaping
+        // this catch means escaping an async request listener with nothing above
+        // it, which is an unhandled rejection, and crash-log.js turns that into
+        // exit(1). A broken activity hook must not take the daemon down, and it
+        // must not cost the socket its answer below either.
+        try {
+          hooks.onRequestEnd?.(entry.reqId, {
+            method: req.method, path: req.url, account: null, status,
+            model: null, sessionId: entry.sessionId, pinned: false,
+          });
+        } catch (hookErr) {
+          reportFailure('[TeamClaude] activity hook failed while closing a request:', hookErr);
+        }
+      }
+      // The code above the inner try (the egress hold, the pin parsing, body
+      // buffering, the activity hooks) runs outside the 502 that guards
+      // forwardRequest, and the inner `finally` calls onRequestEnd after the
+      // response has streamed.
+      answerUnhandled(res);
     }
   };
+}
+
+/**
+ * Report a failure without depending on the console to survive it.
+ *
+ * Under the TUI the console is the TUI: `console.error` appends to the activity
+ * log and repaints, so a render that throws makes `console.error` throw. That
+ * matters because these reports are the FIRST statement of the paths that
+ * recover from a throw, and the throw being recovered from is often the same
+ * broken render. An unguarded report there skips the whole recovery.
+ *
+ * Falls back to stderr rather than swallowing, so a render bug still leaves a
+ * diagnostic. The TUI already does this when its own activity stream fails.
+ *
+ * `writeSync` rather than `process.stderr.write`, because the fallback has to
+ * fail the way this function promises to. A closed stderr makes the stream
+ * surface EPIPE asynchronously, as an error event no `try` around the call can
+ * see, and this daemon treats an uncaught EPIPE as fatal. `writeSync` throws
+ * where it is called, so the catch below is real.
+ */
+function reportFailure(...args) {
+  try {
+    console.error(...args);
+  } catch {
+    try {
+      writeSync(2, `${args.map(a => a?.stack || String(a)).join(' ')}\n`);
+    } catch { /* nothing left to report with */ }
+  }
+}
+
+/**
+ * Has the client gone away?
+ *
+ * `res.destroyed` answers that on the base HTTP/1 listener and not on the MITM
+ * one: `Http2ServerResponse` has no `destroyed` property at all, so the read is
+ * `undefined` and the question is answered "no" for every h2 request, on the
+ * path that carries most of the traffic. The h2 equivalent lives on the
+ * underlying stream.
+ *
+ * Asked wherever the answer decides whether to spend something the client will
+ * never receive. On the retry ladder that is an upstream call and a slice of an
+ * account's weekly quota per rung, which is the opposite of what rotation is
+ * for. In practice the ladder is cut short by the abort probe handed to
+ * `admit()`, which is polled while a request waits for a concurrency slot; the
+ * reads on the individual rungs are the backstop for a request that never
+ * waited.
+ *
+ * In `streamResponse` the cost is the handler itself. Writing to a cancelled
+ * stream returns false, and the backpressure wait below then listens for a
+ * `drain` or a `close` that has already happened and will not happen again, so
+ * the handler never returns and its activity entry never closes.
+ */
+function clientGone(res) {
+  return !!res.destroyed || !!res.stream?.destroyed;
+}
+
+/**
+ * The last response an outer catch can send. Three states:
+ *
+ *   - Nothing written yet: send a 502. Guarded on headersSent, because a second
+ *     writeHead raises ERR_HTTP_HEADERS_SENT from inside the catch.
+ *   - Headers sent, body unfinished: destroy. There is no status left to send,
+ *     and end() would present the truncated bytes as a complete reply.
+ *   - Response already ended: leave it alone, the client has its answer.
+ *
+ * `forwardRequest`'s own catch already carries the same pair of arms.
+ */
+function answerUnhandled(res) {
+  if (!res.headersSent && !clientGone(res)) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
+  } else if (!res.writableEnded) {
+    res.destroy();
+  }
 }
 
 // Per-request https.Agent tunneled through sx.org — one-shot (no keep-alive
@@ -747,13 +1105,27 @@ function relayStream(req, res, upstream, sx) {
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
     upstreamRes.pipe(res);
+    // pipe() only propagates 'end'. If the upstream leg dies mid-response
+    // (network blip, upstream restart), upstreamRes emits 'aborted'/'error'
+    // and the pipe just stops — the client's long-poll stays open forever and
+    // the CLI keeps waiting on a channel that can no longer deliver events.
+    // Destroying res closes the client socket, which is the one signal its
+    // reconnect logic reacts to.
+    upstreamRes.on('aborted', () => res.destroy());
+    upstreamRes.on('error', () => res.destroy());
   });
 
   upstreamReq.on('error', (err) => {
-    console.error('[TeamClaude] Remote Control relay error:', err.message);
+    console.error('[TeamClaude] Remote Control relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    } else {
+      // Headers already went out (the long-poll was live), so a 502 body can't
+      // be written anymore. Close the client socket instead of leaving it
+      // half-dead: seen in production as a `socket hang up` logged here while
+      // the CLI's Remote Control stream silently waited on it for 45+ minutes.
+      res.destroy();
     }
   });
   // Client disconnected (e.g. Claude Code closed the channel): tear down the
@@ -762,6 +1134,46 @@ function relayStream(req, res, upstream, sx) {
 
   if (['GET', 'HEAD'].includes(req.method)) upstreamReq.end();
   else req.pipe(upstreamReq);
+}
+
+/**
+ * The key gate for a WebSocket upgrade, in the shape of the CONNECT one.
+ *
+ * Separate from `resolveClientAuth` only because the answer depends on the
+ * socket's address as well as the header, and separate from the request path
+ * because `server.on('upgrade')` is a different event that no part of
+ * `requestHandler` runs for.
+ *
+ * `x-api-key` only. A browser cannot set that header on a WebSocket
+ * handshake, so a browser client cannot authenticate here — deliberately.
+ * The obvious alternative, reading the key out of `Sec-WebSocket-Protocol`,
+ * is worse than not supporting browsers: relayUpgrade forwards that header to
+ * the upstream (it strips `x-api-key`, which is the whole reason the
+ * handshake carries no operator credential today), the offer list is
+ * attacker-sized so it turns one guess per connection into thousands, and the
+ * proxy cannot honour the negotiation anyway because it relays the handshake
+ * rather than answering it.
+ */
+export function resolveUpgradeAuth(req, socket, proxyConfig) {
+  const auth = resolveClientAuth(proxyConfig, req?.headers?.['x-api-key']);
+  if (auth.ok) return auth;
+  // Loopback is exempt from the key requirement, exactly as the HTTP and
+  // CONNECT gates are — with the request path's two conditions on top, for
+  // the same actor: a web page in the operator's browser. A page can open a
+  // WebSocket to 127.0.0.1 with no CORS check at all, and its handshake is
+  // loopback-sourced too. What it cannot forge is `Origin`, which a browser
+  // sets on every handshake and a CLI never sends, nor `Host`, which a
+  // rebound name (attacker.example → 127.0.0.1) leaves naming the attacker.
+  if (!isLoopbackAddr(socket?.remoteAddress)) return auth;
+  const bindHost = proxyConfig?.host;
+  const origin = req?.headers?.origin;
+  if (origin) {
+    let originHost;
+    try { originHost = new URL(origin).host; } catch { return auth; }
+    if (!isLocalHostHeader(originHost, bindHost)) return auth;
+  }
+  if (!isLocalHostHeader(req?.headers?.host, bindHost)) return auth;
+  return { ok: true, client: null };
 }
 
 /**
@@ -781,8 +1193,9 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     const lk = key.toLowerCase();
     // Unlike relayStream, do NOT strip 'upgrade'/'connection' here — they ARE
     // the handshake. Only 'host' (the client transport reconstructs it from
-    // `target`) and h2 pseudo-headers are dropped.
-    if (lk.startsWith(':') || lk === 'host') continue;
+    // `target`), h2 pseudo-headers and the proxy's own x-api-key (the client's
+    // credential to us, not to upstream) are dropped.
+    if (lk.startsWith(':') || lk === 'host' || lk === 'x-api-key') continue;
     headers[key] = value;
   }
 
@@ -818,7 +1231,7 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
   });
 
   upstreamReq.on('error', (err) => {
-    console.error('[TeamClaude] Remote Control WebSocket relay error:', err.message);
+    console.error('[TeamClaude] Remote Control WebSocket relay error:', describeConnectError(err));
     socket.destroy();
   });
   socket.on('error', () => upstreamReq.destroy());
@@ -858,7 +1271,7 @@ async function relayRaw(req, res, upstream, sx) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    console.error('[TeamClaude] Raw relay error:', err.message);
+    console.error('[TeamClaude] Raw relay error:', describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -983,7 +1396,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -992,7 +1405,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -1032,7 +1445,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
     if (lk.startsWith(':')) continue;
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
+    // Both credential headers are dropped, not just the one the account will
+    // set: applyAuthHeaders overwrites `authorization` only for bearer-token
+    // accounts, so on an API-key account the CLIENT's own
+    // `Authorization: Bearer <its Anthropic OAuth token>` would otherwise ride
+    // along untouched — to whatever host that account's `upstream` names.
+    if (lk === 'x-api-key' || lk === 'authorization') continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
@@ -1086,7 +1504,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
-    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    if (!await accountManager.admit(account.index, () => clientGone(res))) return;
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -1147,7 +1565,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           accountManager.markRateLimited(account.index, hold);
         }
         ctx.tried.add(account.index);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
 
@@ -1175,7 +1593,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // 429ing upstream can't loop forever through sx.
       if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1185,7 +1603,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        if (res.destroyed) return;
+        if (clientGone(res)) return;
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1194,7 +1612,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // The pause above keeps other requests off this account meanwhile.
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
-      if (!res.headersSent && !res.destroyed) {
+      if (!res.headersSent && !clientGone(res)) {
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
@@ -1237,7 +1655,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
-      if (res.destroyed) return;
+      if (clientGone(res)) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1286,7 +1704,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       res.end(buf);
     }
   } catch (err) {
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));
 
     const isTransient = err instanceof Error &&
       (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
@@ -1330,7 +1748,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
-        error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
+        error: { type: 'proxy_error', message: `Upstream error: ${describeConnectError(err)}` },
       }));
     } else if (!res.writableEnded) {
       // Error after headers were already sent (mid-stream) and it wasn't
@@ -1396,7 +1814,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       if (done) break;
 
       // Client disconnected — stop reading from upstream
-      if (res.destroyed) break;
+      if (clientGone(res)) break;
 
       // Forward chunk immediately
       const ok = res.write(value);
@@ -1426,7 +1844,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
           res.once('drain', done);
           res.once('close', done);
         });
-        if (res.destroyed) break;
+        if (clientGone(res)) break;
       }
     }
 
@@ -1509,7 +1927,11 @@ function recordContextUsage(ctx, workContextStore, accountManager, accountIndex,
 export function rewriteModel(body, modelMap) {
   try {
     const obj = JSON.parse(body.toString('utf8'));
-    if (obj.model && modelMap[obj.model]) {
+    // Own keys only: the map is a plain object, so a model named
+    // "constructor" or "toString" would otherwise look up a prototype
+    // function, which JSON.stringify then drops — the request goes upstream
+    // with no model at all.
+    if (typeof obj.model === 'string' && Object.hasOwn(modelMap, obj.model) && typeof modelMap[obj.model] === 'string') {
       obj.model = modelMap[obj.model];
       return Buffer.from(JSON.stringify(obj), 'utf8');
     }
