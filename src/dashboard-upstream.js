@@ -319,38 +319,62 @@ export function uniqSorted(values) {
 // key the status poll uses. Pure, so the test suite can send exactly this
 // through a real proxy and prove the same-origin CSRF gate lets the page in.
 /**
- * When an account that cannot serve now is expected to be able to again, or
- * null when nothing says it is held.
+ * Everything currently holding an account back, each with the scope it holds.
  *
- * Three things hold an account, and they clear at different times: an upstream
- * 429 (rateLimitedUntil), an operator/proxy pause (pausedUntil), and a spent
- * quota window, which clears at that window's own reset. The soonest of them is
- * the answer, because the account is back the moment the last one lifts — and
- * the reason is carried alongside so the page can say which clock it is.
+ * Availability is per model, exactly as the server computes it: the shared 5h
+ * bucket, a pause and a 429 stop every request, while a weekly bucket stops
+ * only the models it governs. Fable and Sonnet meter their own weekly quota, so
+ * a spent Fable bucket bars Fable alone and the account keeps serving
+ * everything else — which is the failover the pool relies on.
  *
- * A window counts as spent at the configured switch threshold, not at 100%.
- * The threshold is the point at which the proxy stops selecting the account —
- * so from the pool's perspective it is already out, whatever the upstream would
- * still accept. `threshold` is the fleet's switchThreshold; 0.98 is the default
- * the server uses when none is configured.
+ * `threshold` is the fleet's switchThreshold: the point at which the proxy
+ * stops selecting the account, whatever the upstream would still accept. 0.98
+ * is the server's own default.
+ */
+export function accountHolds(account, now, threshold) {
+  var limit = typeof threshold === 'number' && threshold > 0 ? threshold : 0.98;
+  var holds = [];
+  var q = (account && account.quota) || {};
+  // getStatus sends these two as ISO strings and the quota resets as epoch
+  // numbers, so they are parsed rather than compared as they arrive — a string
+  // compared against a number is quietly always false, and the hold would
+  // simply never be reported.
+  var at = function (v) {
+    if (v == null) return NaN;
+    return typeof v === 'number' ? v : Date.parse(v);
+  };
+  var rl = at(account && account.rateLimitedUntil);
+  var pu = at(account && account.pausedUntil);
+  if (rl > now) holds.push({ at: rl, reason: 'upstream 429 hold', scope: 'all' });
+  if (pu > now) holds.push({ at: pu, reason: 'paused', scope: 'all' });
+  if (q.unified5h != null && q.unified5h >= limit && at(q.unified5hReset) > now) {
+    holds.push({ at: at(q.unified5hReset), reason: '5h quota', scope: 'all' });
+  }
+  // The general weekly governs every model that does not meter its own. When a
+  // family bucket is absent the server falls back to this one, so an account
+  // with no Fable bucket is held for Fable by this hold too.
+  if (q.unified7d != null && q.unified7d >= limit && at(q.unified7dReset) > now) {
+    holds.push({ at: at(q.unified7dReset), reason: 'weekly quota', scope: q.unified7dFable == null && q.unified7dSonnet == null ? 'all' : 'general' });
+  }
+  if (q.unified7dFable != null && q.unified7dFable >= limit && at(q.unified7dFableReset) > now) {
+    holds.push({ at: at(q.unified7dFableReset), reason: 'Fable weekly quota', scope: 'fable' });
+  }
+  if (q.unified7dSonnet != null && q.unified7dSonnet >= limit && at(q.unified7dSonnetReset) > now) {
+    holds.push({ at: at(q.unified7dSonnetReset), reason: 'Sonnet weekly quota', scope: 'sonnet' });
+  }
+  return holds;
+}
+
+/**
+ * The soonest hold that stops EVERY model, or null when the account can still
+ * serve something. This is what "unavailable" has to mean: an account out of
+ * its Fable allowance is not out of the pool, it is out for Fable, and filing
+ * it under unavailable would contradict the routing table on the same page.
  */
 export function availabilityAt(account, now, threshold) {
-  var limit = typeof threshold === 'number' && threshold > 0 ? threshold : 0.98;
-  var held = [];
-  if (account && account.rateLimitedUntil > now) held.push({ at: account.rateLimitedUntil, reason: 'upstream 429 hold' });
-  if (account && account.pausedUntil > now) held.push({ at: account.pausedUntil, reason: 'paused' });
-  var q = (account && account.quota) || {};
-  var windows = [
-    { use: q.unified5h, at: q.unified5hReset, label: '5h quota' },
-    { use: q.unified7d, at: q.unified7dReset, label: 'weekly quota' },
-    { use: q.unified7dSonnet, at: q.unified7dSonnetReset, label: 'weekly Sonnet quota' },
-    { use: q.unified7dFable, at: q.unified7dFableReset, label: 'weekly Fable quota' },
-  ];
-  windows.forEach(function (w) {
-    if (w.use != null && w.use >= limit && w.at > now) held.push({ at: w.at, reason: w.label });
-  });
-  if (!held.length) return null;
-  return held.reduce(function (a, b) { return b.at < a.at ? b : a; });
+  var blocking = accountHolds(account, now, threshold).filter(function (h) { return h.scope === 'all'; });
+  if (!blocking.length) return null;
+  return blocking.reduce(function (a, b) { return b.at < a.at ? b : a; });
 }
 
 /**
@@ -396,6 +420,29 @@ export function groupAccounts(accounts, now, threshold) {
     else live.push(a);
   });
   return { live: live, held: held, off: off };
+}
+
+/**
+ * Per-model usage rows for one account, busiest first.
+ *
+ * The fleet's quota is metered per model family, but until now nothing said
+ * which models were actually being run — only that some family bucket was
+ * filling. This is that, counted as the responses land.
+ */
+export function modelRows(usage) {
+  var by = (usage && usage.byModel) || {};
+  return Object.keys(by).map(function (name) {
+    var v = by[name] || {};
+    return {
+      model: name,
+      requests: v.requests || 0,
+      tokens: (v.inputTokens || 0) + (v.outputTokens || 0),
+      inputTokens: v.inputTokens || 0,
+      outputTokens: v.outputTokens || 0,
+    };
+  }).sort(function (a, b) {
+    return b.tokens - a.tokens || b.requests - a.requests || (a.model < b.model ? -1 : 1);
+  });
 }
 
 export function switchRequest(name, key) {
@@ -618,8 +665,8 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, groupAccounts,
-  availabilityAt, formatCountdown, routeRows, problems,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, groupAccounts, modelRows,
+  accountHolds, availabilityAt, formatCountdown, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -702,8 +749,13 @@ const PAGE = `<!doctype html>
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .models { margin-top: 4px; }
+  .mrow { display: flex; gap: 8px; font-size: 12px; color: var(--dim); }
+  .mname { color: var(--text); font-variant-numeric: tabular-nums; }
+  .mval { margin-left: auto; font-variant-numeric: tabular-nums; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
   .ticker { color: var(--warn); font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .ticker.partial { color: var(--dim); }
   #current .who { font-size: 16px; font-weight: 600; }
   #current .row { margin-bottom: 2px; }
   .ticker b { color: var(--text); font-weight: 600; }
@@ -977,14 +1029,16 @@ ${SHARED_HELPERS}
     // A held account gets a live countdown to the moment it can serve again.
     // The timestamp is put on the node so the one-second tick can retime it
     // without re-rendering the card, which would fight the five-second poll.
-    var hold = availabilityAt(a, Date.now(), fleetThreshold);
-    if (hold) {
-      var tick = el('div', 'ticker');
-      tick.setAttribute('data-until', String(hold.at));
-      tick.setAttribute('data-reason', hold.reason);
+    // One line per hold. An account out of its Fable allowance is still in the
+    // pool for everything else, so the line names what is stopped rather than
+    // implying the account is gone.
+    accountHolds(a, Date.now(), fleetThreshold).forEach(function (h) {
+      var tick = el('div', h.scope === 'all' ? 'ticker' : 'ticker partial');
+      tick.setAttribute('data-until', String(h.at));
+      tick.setAttribute('data-reason', h.scope === 'all' ? h.reason : h.reason + ' (other models unaffected)');
       retime(tick);
       card.appendChild(tick);
-    }
+    });
     var q = a.quota || {};
     if (q.unified5h != null || q.unified7d != null) {
       card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
@@ -1001,6 +1055,20 @@ ${SHARED_HELPERS}
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
+    // What this account actually ran, when anything has run on it. Absent
+    // rather than an empty table on an account that has served nothing this
+    // session — the counters start at process start, not at account creation.
+    var models = modelRows(u);
+    if (models.length) {
+      var mt = el('div', 'models');
+      models.forEach(function (r) {
+        var row = el('div', 'mrow');
+        row.appendChild(el('span', 'mname', r.model));
+        row.appendChild(el('span', 'mval', r.requests + ' req · ' + fmtNum(r.tokens) + ' tok'));
+        mt.appendChild(row);
+      });
+      card.appendChild(mt);
+    }
     return card;
   }
 

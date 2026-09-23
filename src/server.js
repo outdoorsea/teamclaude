@@ -1899,10 +1899,10 @@ function parseSSEUsage(event, accountIndex, accountManager, ctx, workContextStor
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0, ctx?.model, true);
       recordContextUsage(ctx, workContextStore, accountManager, accountIndex, data.message.usage.input_tokens, 0);
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens, ctx?.model, false);
       recordContextUsage(ctx, workContextStore, accountManager, accountIndex, 0, data.usage.output_tokens);
     }
   } catch {
@@ -1914,7 +1914,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, ctx, workCon
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens, ctx?.model, true);
       recordContextUsage(ctx, workContextStore, accountManager, accountIndex, json.usage.input_tokens, json.usage.output_tokens);
     }
   } catch {

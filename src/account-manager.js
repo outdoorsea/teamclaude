@@ -87,6 +87,10 @@ function makeAccount(acct, index) {
       totalOutputTokens: 0,
       totalRequests: 0,
       lastUsed: null,
+      // Per-model breakdown, keyed by the model string the client asked for.
+      // In memory only, like the totals beside it: this answers "what is this
+      // fleet actually running" for the session, not for all time.
+      byModel: Object.create(null),
     },
     rateLimitedUntil: null,
     throttledAt: null,
@@ -1246,11 +1250,30 @@ export class AccountManager {
   /**
    * Update cumulative token usage from response body data.
    */
-  updateUsage(accountIndex, inputTokens, outputTokens) {
+  /**
+   * @param {number} accountIndex
+   * @param {number} inputTokens
+   * @param {number} outputTokens
+   * @param {string|null} [model] - the model the client asked for, when known
+   * @param {boolean} [countRequest] - true exactly once per request, so the
+   *   per-model request count is not inflated by a stream's many usage events
+   */
+  updateUsage(accountIndex, inputTokens, outputTokens, model = null, countRequest = false) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+    if (!model) return;
+    const by = account.usage.byModel || (account.usage.byModel = Object.create(null));
+    // Own-property lookup only: a model name arrives off the wire, and
+    // `__proto__` or `constructor` must not reach an inherited object.
+    const entry = Object.prototype.hasOwnProperty.call(by, model)
+      ? by[model]
+      : (by[model] = { requests: 0, inputTokens: 0, outputTokens: 0, lastUsed: null });
+    if (inputTokens) entry.inputTokens += inputTokens;
+    if (outputTokens) entry.outputTokens += outputTokens;
+    if (countRequest) entry.requests++;
+    entry.lastUsed = new Date().toISOString();
   }
 
   /**
@@ -1538,7 +1561,13 @@ export class AccountManager {
         status: a.status,
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },
-        usage: { ...a.usage },
+        // byModel is copied rather than shared: getStatus hands this object to
+        // the control plane, and the live counters must not be reachable there.
+        usage: {
+          ...a.usage,
+          byModel: Object.fromEntries(
+            Object.entries(a.usage.byModel || {}).map(([m, v]) => [m, { ...v }])),
+        },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,
