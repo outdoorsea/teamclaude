@@ -319,22 +319,6 @@ export function uniqSorted(values) {
 // key the status poll uses. Pure, so the test suite can send exactly this
 // through a real proxy and prove the same-origin CSRF gate lets the page in.
 /**
- * Accounts in draw order: the ones rotation can still reach first, disabled
- * ones after them. Stable within each group, so the order the server sent —
- * which is the rotation order — is preserved among the live accounts instead
- * of being re-sorted into something that no longer means anything.
- *
- * A disabled account is still listed rather than hidden: it is a thing the
- * operator turned off and has to be able to turn back on.
- */
-export function orderAccounts(accounts) {
-  var live = [];
-  var off = [];
-  (accounts || []).forEach(function (a) { (a && a.disabled ? off : live).push(a); });
-  return live.concat(off);
-}
-
-/**
  * When an account that cannot serve now is expected to be able to again, or
  * null when nothing says it is held.
  *
@@ -344,12 +328,14 @@ export function orderAccounts(accounts) {
  * the answer, because the account is back the moment the last one lifts — and
  * the reason is carried alongside so the page can say which clock it is.
  *
- * A window counts as spent at 100%, not at the switch threshold: crossing the
- * threshold moves traffic elsewhere but the account can still serve, and a
- * countdown on it would be telling the operator to wait for something that is
- * not actually blocked.
+ * A window counts as spent at the configured switch threshold, not at 100%.
+ * The threshold is the point at which the proxy stops selecting the account —
+ * so from the pool's perspective it is already out, whatever the upstream would
+ * still accept. `threshold` is the fleet's switchThreshold; 0.98 is the default
+ * the server uses when none is configured.
  */
-export function availabilityAt(account, now) {
+export function availabilityAt(account, now, threshold) {
+  var limit = typeof threshold === 'number' && threshold > 0 ? threshold : 0.98;
   var held = [];
   if (account && account.rateLimitedUntil > now) held.push({ at: account.rateLimitedUntil, reason: 'upstream 429 hold' });
   if (account && account.pausedUntil > now) held.push({ at: account.pausedUntil, reason: 'paused' });
@@ -361,7 +347,7 @@ export function availabilityAt(account, now) {
     { use: q.unified7dFable, at: q.unified7dFableReset, label: 'weekly Fable quota' },
   ];
   windows.forEach(function (w) {
-    if (w.use != null && w.use >= 1 && w.at > now) held.push({ at: w.at, reason: w.label });
+    if (w.use != null && w.use >= limit && w.at > now) held.push({ at: w.at, reason: w.label });
   });
   if (!held.length) return null;
   return held.reduce(function (a, b) { return b.at < a.at ? b : a; });
@@ -383,6 +369,33 @@ export function formatCountdown(ms) {
   if (h > 0) return h + 'h ' + m + 'm';
   if (m > 0) return m + 'm ' + sec + 's';
   return sec + 's';
+}
+
+/**
+ * The three ways an account can stand relative to the pool, in draw order.
+ *
+ *   live  — rotation can select it now
+ *   held  — it cannot serve until something resets: a spent quota window, an
+ *           upstream 429, or a pause. Temporary, and it says when it is back.
+ *   off   — the operator disabled it. Indefinite, and only they can undo it.
+ *
+ * held and off are kept apart because they are different questions. "Wait" and
+ * "someone turned this off" look identical in a single greyed-out list, and the
+ * operator's next action is completely different for each.
+ *
+ * Stable within each group, so live accounts keep the order the server sent,
+ * which is the rotation order.
+ */
+export function groupAccounts(accounts, now, threshold) {
+  var live = [];
+  var held = [];
+  var off = [];
+  (accounts || []).forEach(function (a) {
+    if (a && a.disabled) off.push(a);
+    else if (availabilityAt(a, now, threshold)) held.push(a);
+    else live.push(a);
+  });
+  return { live: live, held: held, off: off };
 }
 
 export function switchRequest(name, key) {
@@ -605,7 +618,7 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, orderAccounts,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, groupAccounts,
   availabilityAt, formatCountdown, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -700,6 +713,14 @@ const PAGE = `<!doctype html>
      stacking context its children cannot escape — the enable button would fade
      with everything else, and that button is the one thing here that must stay
      legible and obviously clickable. */
+  /* Two ways to be out of the pool, drawn differently on purpose.
+     "held" is waiting: it comes back by itself, so the card stays fully legible
+     and is marked with the warn colour that the countdown and the spent bar
+     already use — nothing is dimmed, because the operator is reading it, not
+     dismissing it.
+     "off" is switched off: indefinite, and only the operator undoes it, so the
+     card is ghosted and only the way back in stays bright. */
+  .card.held { border-left: 3px solid var(--warn); }
   .card.off { background: transparent; border-style: dashed; }
   .card.off > *:not(.row) { opacity: .45; }
   .card.off .row > *:not(.primary) { opacity: .45; }
@@ -772,6 +793,14 @@ const PAGE = `<!doctype html>
     </div>
     <h2>Accounts</h2>
     <div id="accounts"></div>
+    <div id="heldWrap" style="display:none">
+      <h2>Unavailable</h2>
+      <div id="held"></div>
+    </div>
+    <div id="offWrap" style="display:none">
+      <h2>Disabled</h2>
+      <div id="off"></div>
+    </div>
     <div id="clientsWrap" style="display:none">
       <h2>Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
@@ -887,38 +916,32 @@ ${SHARED_HELPERS}
   function renderCurrent(s, currentAccounts) {
     var wrap = document.getElementById('currentWrap');
     var box = document.getElementById('current');
-    var names = currentAccounts
-      ? Object.keys(currentAccounts).map(function (k) { return currentAccounts[k]; })
-      : (s.currentAccount ? [s.currentAccount] : []);
-    var chosen = (s.accounts || []).filter(function (a) { return names.indexOf(a.name) !== -1; });
+    box.textContent = '';
+    var chosen = currentAccountsOf(s, currentAccounts);
     if (!chosen.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
-    box.textContent = '';
+    // The whole card, not a summary of it: this is now the ONLY place the
+    // current account is drawn, so anything left out here would be a control
+    // the operator no longer has.
     chosen.forEach(function (a) {
-      var row = el('div', 'row');
-      row.appendChild(el('span', 'who', a.name));
-      accountBadges(a, s.currentAccount, currentAccounts, null, s.switchThreshold, s.switchThresholds)
-        .forEach(function (badge) { row.appendChild(el('span', 'badge ' + badge.cls, badge.text)); });
-      box.appendChild(row);
-      if (a.unavailable) box.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
-      var hold = availabilityAt(a, Date.now());
-      if (hold) {
-        var tick = el('div', 'ticker');
-        tick.setAttribute('data-until', String(hold.at));
-        tick.setAttribute('data-reason', hold.reason);
-        retime(tick);
-        box.appendChild(tick);
-      }
-      // Same line the card carries, composed the same way: accountTokens is a
-      // count, not a sentence, and rendering it raw put a bare "0" here.
-      var u = a.usage || {};
-      var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
-      box.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
+      box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds));
     });
   }
 
+  // The accounts the server is currently serving from — one per provider on a
+  // mixed fleet, otherwise the single currentAccount.
+  function currentAccountsOf(s, currentAccounts) {
+    var names = currentAccounts
+      ? Object.keys(currentAccounts).map(function (k) { return currentAccounts[k]; })
+      : (s.currentAccount ? [s.currentAccount] : []);
+    return (s.accounts || []).filter(function (a) { return names.indexOf(a.name) !== -1; });
+  }
+
   function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
-    var card = el('div', a.disabled ? 'card off' : 'card');
+    var cls = a.disabled ? 'card off'
+      : availabilityAt(a, Date.now(), fleetThreshold) ? 'card held'
+      : 'card';
+    var card = el('div', cls);
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
     var isCurrent = currentAccounts
@@ -954,7 +977,7 @@ ${SHARED_HELPERS}
     // A held account gets a live countdown to the moment it can serve again.
     // The timestamp is put on the node so the one-second tick can retime it
     // without re-rendering the card, which would fight the five-second poll.
-    var hold = availabilityAt(a, Date.now());
+    var hold = availabilityAt(a, Date.now(), fleetThreshold);
     if (hold) {
       var tick = el('div', 'ticker');
       tick.setAttribute('data-until', String(hold.at));
@@ -1226,9 +1249,21 @@ ${SHARED_HELPERS}
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
     renderCurrent(s, currentAccounts);
-    var acc = document.getElementById('accounts');
-    acc.textContent = '';
-    orderAccounts(s.accounts).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
+    // Drawn in its own panel above, so it is not repeated here.
+    var shown = currentAccountsOf(s, currentAccounts).map(function (a) { return a.name; });
+    var rest = (s.accounts || []).filter(function (a) { return shown.indexOf(a.name) === -1; });
+    var groups = groupAccounts(rest, Date.now(), s.switchThreshold);
+    [['accounts', groups.live, null], ['held', groups.held, 'heldWrap'], ['off', groups.off, 'offWrap']]
+      .forEach(function (g) {
+        var box = document.getElementById(g[0]);
+        box.textContent = '';
+        g[1].forEach(function (a) {
+          box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds));
+        });
+        // The heading belongs to the section, so an empty group takes its
+        // heading with it rather than standing over nothing.
+        if (g[2]) document.getElementById(g[2]).style.display = g[1].length ? '' : 'none';
+      });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
