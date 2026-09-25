@@ -32,7 +32,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - Tells a spent quota bucket apart from a per-minute rate limit and only rotates on the first one. Rotating on a rate limit would just move the burst to the next account and drop the warm cache, so it paces the same account instead.
 - Paces requests onto a freshly switched account, so a herd of agents failing over at the same instant doesn't throttle it and cascade down the fleet.
 - TUI with quota bars, reset countdowns, activity log, and settings you can change while it runs, including adding and removing accounts.
-- Web dashboard (`teamclaude attach` or `http://localhost:3456/dashboard/`) for live status, account switching, and controls when the server runs headless.
+- Web dashboard (`teamclaude attach` or `http://localhost:3456/teamclaude/dashboard`) for live status, account switching, and controls when the server runs headless.
 - MCP server (`teamclaude mcp`) that lets Claude Code agents claim work items, so token usage can be attributed to a project, PRD, PR, or bead.
 - Switchyard integration (`teamclaude switchyard login`) that pushes attributed token usage to Switchyard for billing and cost visibility.
 - Catches hardcoded `api.anthropic.com` endpoints (the Claude Design MCP, for one) through a local MITM forward proxy, not only what `ANTHROPIC_BASE_URL` covers.
