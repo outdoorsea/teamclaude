@@ -1,5 +1,5 @@
-// ── UPSTREAM'S DASHBOARD, ported alongside this fork's own ──────────────
-// Served at /teamclaude/dashboard; the fork's own page stays at /dashboard/.
+// ── WEB DASHBOARD, ported from upstream ─────────────────────────────
+// Served at /teamclaude/dashboard; `/` and the old /dashboard route redirect to it.
 //
 // Upstream's file, plus the light-theme change on the feat/dashboard-theme
 // branch (dashboardCsp hashing every inline script, the light palette, the
