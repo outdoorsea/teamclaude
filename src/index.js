@@ -38,6 +38,11 @@ import { SessionTitles } from './session-titles.js';
 import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
+import { UsagePusher } from './usage-pusher.js';
+import { authorizeSwitchyard } from './switchyard-auth.js';
+import { WorkContextStore } from './work-context.js';
+import { runMcpServer } from './mcp-server.js';
+import { installMcpServer, uninstallMcpServer, renderInstallResult } from './mcp-install.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
@@ -210,6 +215,21 @@ switch (command) {
     await updateCommand();
     process.exit(0);
     break;
+  case 'mcp':
+    if (args[1] === 'install') {
+      await mcpInstallCommand();
+      process.exit(0);
+    }
+    if (args[1] === 'uninstall') {
+      await mcpUninstallCommand();
+      process.exit(0);
+    }
+    runMcpServer();
+    break;
+  case 'switchyard':
+    await switchyardCommand();
+    process.exit(0);
+    break;
   case 'version':
   case '--version':
   case '-V':
@@ -230,6 +250,98 @@ switch (command) {
     }
     await serverCommand();
     break;
+}
+
+// ── mcp install / uninstall ─────────────────────────────────
+
+async function mcpInstallCommand() {
+  const scope = argValue('--scope') || 'user';
+  try {
+    const result = await installMcpServer(scope);
+    console.log(renderInstallResult(result));
+  } catch (err) {
+    console.error(`Failed to install TeamClaude MCP server: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function mcpUninstallCommand() {
+  const scope = argValue('--scope') || 'user';
+  try {
+    const result = await uninstallMcpServer(scope);
+    console.log(renderInstallResult(result));
+  } catch (err) {
+    console.error(`Failed to uninstall TeamClaude MCP server: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── switchyard login ────────────────────────────────────────
+
+async function switchyardCommand() {
+  const sub = args[1];
+  if (sub === '--help' || sub === '-h' || !sub) {
+    console.log(`Usage: teamclaude switchyard login [--base-url URL]`);
+    console.log('');
+    console.log('Log in to switchyard.work via browser and save the API token to');
+    console.log('TeamClaude config, enabling the Switchyard usage pusher.');
+    return;
+  }
+  if (sub === 'login') {
+    await switchyardLoginCommand();
+    return;
+  }
+  console.error(`Unknown switchyard subcommand: ${sub}`);
+  console.error(`Usage: teamclaude switchyard login [--base-url URL]`);
+  process.exit(1);
+}
+
+async function switchyardLoginCommand() {
+  const baseUrl = argValue('--base-url') || process.env.SWITCHYARD_BASE_URL || 'https://switchyard.work';
+  try {
+    const result = await authorizeSwitchyard(baseUrl);
+    await atomicConfigUpdate((/** @type {Record<string, any>} */ cfg) => {
+      cfg.switchyard = cfg.switchyard || {};
+      cfg.switchyard.baseUrl = result.baseUrl;
+      cfg.switchyard.apiKey = result.token;
+      // Default push interval if not already set.
+      if (cfg.switchyard.usageIntervalSeconds == null) {
+        cfg.switchyard.usageIntervalSeconds = 300;
+      }
+    });
+    if (result.workspaces.length === 1) {
+      console.log(`Logged in to Switchyard. Scoped to workspace ${result.workspaces[0].slug}.`);
+    } else if (result.workspaces.length > 1) {
+      console.log(`Logged in to Switchyard. Token spans ${result.workspaces.length} workspaces:`);
+      for (const w of result.workspaces) console.log(`  • ${w.slug}`);
+    } else {
+      console.log('Logged in to Switchyard.');
+    }
+    console.log(`Saved to ${getConfigPath()}`);
+    console.log('Run `teamclaude service restart` if the server is running, or the pusher will pick it up on the next config reload.');
+  } catch (err) {
+    console.error(`Switchyard login failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// Switchyard usage-push settings from env and config. Env wins.
+/** @param {Record<string, any>|null|undefined} cfg */
+function getSwitchyardUsageConfig(cfg) {
+  const baseUrl = process.env.TEAMCLAUDE_SWITCHYARD_BASE_URL
+    || process.env.SWITCHYARD_BASE_URL
+    || cfg?.switchyard?.baseUrl
+    || null;
+  const apiKey = process.env.TEAMCLAUDE_SWITCHYARD_API_KEY
+    || process.env.SWITCHYARD_API_TOKEN
+    || cfg?.switchyard?.apiKey
+    || null;
+  const envSeconds = process.env.TEAMCLAUDE_SWITCHYARD_USAGE_INTERVAL_SECONDS;
+  const cfgSeconds = cfg?.switchyard?.usageIntervalSeconds;
+  const intervalSeconds = envSeconds != null ? Number(envSeconds)
+    : cfgSeconds != null ? Number(cfgSeconds)
+    : 300;
+  return { baseUrl, apiKey, intervalMs: intervalSeconds * 1000 };
 }
 
 // ── server ──────────────────────────────────────────────────
@@ -265,6 +377,10 @@ async function serverCommand() {
 
   // --activity-log <file>
   const activityLogPath = argValue('--activity-log') || null;
+
+  // --usage-log <file> (also TEAMCLAUDE_USAGE_LOG or config.usageLogPath):
+  // where the work-context usage ledger is appended, one JSON line per report.
+  const usageLogPath = argValue('--usage-log') || process.env.TEAMCLAUDE_USAGE_LOG || config.usageLogPath || null;
 
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
@@ -389,6 +505,9 @@ async function serverCommand() {
   let prober = null;
   // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
+  // Opt-in Switchyard usage push (off until switchyard.baseUrl is set).
+  /** @type {UsagePusher|null} */
+  let usagePusher = null;
   const serverStartedAt = Date.now();
   // Read once here, not per request: `teamclaude update` swaps package.json on
   // disk while this process keeps running the old code, and status must report
@@ -519,6 +638,15 @@ async function serverCommand() {
         warmer.reschedule(ms);
         delete config.warmupSchedule;
         config.warmupSeconds = diskConfig.warmupSeconds || 0;
+      }
+    }
+    if (usagePusher) {
+      const sw = getSwitchyardUsageConfig(diskConfig);
+      const wasOn = usagePusher.intervalMs > 0 && usagePusher.baseUrl;
+      const nowOn = sw.intervalMs > 0 && sw.baseUrl;
+      if (sw.baseUrl !== usagePusher.baseUrl || sw.apiKey !== usagePusher.apiKey || sw.intervalMs !== usagePusher.intervalMs || nowOn !== wasOn) {
+        config.switchyard = diskConfig.switchyard || {};
+        usagePusher.reschedule(sw);
       }
     }
     return { added, removed };
@@ -687,6 +815,11 @@ async function serverCommand() {
   // binds on the next refusal, not the next restart.
   const redeemer = new ResetCreditRedeemer(accountManager, { config });
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
+  // Work context store: maps Claude Code session ids to the project/PRD/PR/bead
+  // context declared through the teamclaude-work MCP server, and keeps a rolling
+  // usage ledger the server books attributed tokens into.
+  const workContextStore = new WorkContextStore({ usageLogPath });
+  hooks.workContextStore = workContextStore;
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the
@@ -733,6 +866,18 @@ async function serverCommand() {
         durationMs: null,
         error: null,
       })),
+    },
+    switchyard: usagePusher?.getStatus() || {
+      enabled: false,
+      url: null,
+      intervalSeconds: 0,
+      running: false,
+      lastSuccessAt: null,
+      nextRunAt: null,
+      lastError: null,
+    },
+    contexts: {
+      active: workContextStore.activeContexts().length,
     },
   });
   hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
@@ -829,6 +974,10 @@ async function serverCommand() {
   });
   warmer.start();
 
+  // Start the opt-in Switchyard usage push (no-op until switchyard.baseUrl is set).
+  usagePusher = new UsagePusher(workContextStore, getSwitchyardUsageConfig(config));
+  usagePusher.start();
+
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
@@ -852,6 +1001,7 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
+    usagePusher?.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();
@@ -2445,6 +2595,11 @@ Commands:
                       Anchor a continuous five-hour reset cadence in an IANA zone
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
+  mcp                 Run the stdio teamclaude-work MCP server (project-aware token tracking)
+  mcp install         Register it with Claude Code [--scope user|project|local]
+  mcp uninstall       Remove it from Claude Code [--scope user|project|local]
+  switchyard login    Log in to switchyard.work via browser and save the API token
+                      to TeamClaude's config [--base-url URL]
   version             Print the installed version
   help                Show this help
 
@@ -2465,6 +2620,8 @@ Options:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log requests/responses to DIR (server, one file per request)
   --activity-log FILE Append TUI activity lines to FILE (server; works in headless mode too)
+  --usage-log FILE    Append the work-context usage ledger to FILE (server; also
+                      TEAMCLAUDE_USAGE_LOG or config usageLogPath)
   --headless          Run the server without the interactive TUI (for backgrounding)
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead

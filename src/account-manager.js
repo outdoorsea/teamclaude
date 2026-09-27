@@ -381,6 +381,10 @@ function makeAccount(acct, index, listener = null) {
       // weekly, so what a point there costs is its own question, and a sum
       // across families cannot be taken apart afterwards.
       byBucket: {},
+      // Per-model breakdown, keyed by the model string the client asked for:
+      // what this fleet is actually running. In memory only, like the totals
+      // beside it. Null-prototyped because the key arrives off the wire.
+      byModel: Object.create(null),
       totalRequests: 0,
       lastUsed: null,
     },
@@ -4121,6 +4125,20 @@ export class AccountManager {
         || (account.usage.byBucket[bucket] = { cacheReadTokens: 0, cacheCreationTokens: 0 });
       per.cacheReadTokens += read;
       per.cacheCreationTokens += creation;
+      if (typeof model === 'string' && model) {
+        // Booked here and not in updateUsage: this runs once per message with
+        // its settled figures, so a stream's several usage events count once.
+        const byModel = account.usage.byModel;
+        const entry = Object.hasOwn(byModel, model)
+          ? byModel[model]
+          : (byModel[model] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, lastUsed: null });
+        entry.requests++;
+        if (Number.isFinite(usage.input_tokens)) entry.inputTokens += usage.input_tokens;
+        if (Number.isFinite(usage.output_tokens)) entry.outputTokens += usage.output_tokens;
+        entry.cacheReadTokens += read;
+        entry.cacheCreationTokens += creation;
+        entry.lastUsed = new Date().toISOString();
+      }
     }
     // A request with no session id (or one the tracker has forgotten) is still a
     // real spend by the account, so the two scopes are recorded independently.
@@ -4736,7 +4754,13 @@ export class AccountManager {
         // number on the same object stayed put. Every in-process reader today
         // serialises it straight away, so this holds a property rather than
         // fixing a live defect.
-        usage: { ...a.usage, byBucket: copyBuckets(a.usage.byBucket) },
+        // byModel likewise, through fromEntries: its keys come off the wire, and
+        // assigning `__proto__` into a plain object would set its prototype.
+        usage: {
+          ...a.usage,
+          byBucket: copyBuckets(a.usage.byBucket),
+          byModel: Object.fromEntries(Object.entries(a.usage.byModel).map(([m, v]) => [m, { ...v }])),
+        },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,

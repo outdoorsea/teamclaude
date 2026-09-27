@@ -215,6 +215,9 @@ teamclaude warmup rolling 15:30 --timezone Europe/Moscow
                              # Anchor resets at 15:30, then continue every 5h
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude update            # Check npm for a newer teamclaude and install it
+teamclaude switchyard login  # Log in to switchyard.work for usage push
+teamclaude mcp install       # Register the teamclaude-work MCP server with Claude Code
+teamclaude mcp uninstall     # Remove it
 teamclaude version           # Print the installed version
 teamclaude help              # Show all commands
 ```

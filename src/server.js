@@ -769,6 +769,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Work context endpoints — read/write the project/PRD/PR/bead context that
+      // the teamclaude-work MCP server sets on behalf of Claude Code sessions.
+      // Runtime-only state (nothing reaches the config file), so a client key
+      // may use them like switch and reload; POST already passed the
+      // cross-origin gate above.
+      const contextPath = classificationPath(req.url);
+      if (contextPath === '/teamclaude/context' || contextPath === '/teamclaude/contexts' || contextPath === '/teamclaude/usage') {
+        await serveWorkContext(req, res, contextPath, hooks.workContextStore);
+        return;
+      }
+
+      // The bare root and the old /dashboard route redirect to the dashboard,
+      // so a browser pointed at the proxy lands on the page. 302, not 301:
+      // browsers cache a 301 indefinitely, which would outlive any later move.
+      if (req.method === 'GET' && (req.url === '/' || req.url === '/dashboard' || (req.url || '').startsWith('/dashboard/'))) {
+        res.writeHead(302, { Location: '/teamclaude/dashboard', 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+
       // Every control route above matches an exact method and path, so a typo —
       // or just the wrong verb, `GET /teamclaude/reload` — fell through to the
       // forwarder: the request went upstream under a fleet account's credential
@@ -972,6 +992,73 @@ async function readControlBody(req, limit = 64 * 1024) {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * @param {import('node:http').ServerResponse} res
+ * @param {number} status
+ * @param {unknown} body
+ */
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+/**
+ * The work context control routes: /teamclaude/context (GET one, POST set /
+ * claim / release), /teamclaude/contexts (GET the active ones) and
+ * /teamclaude/usage (GET the attributed ledger, grouped). Local state only —
+ * nothing here reaches upstream or the config file.
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @param {string} path the classification path, query removed
+ * @param {any} store the WorkContextStore, absent when the host did not install one
+ */
+async function serveWorkContext(req, res, path, store) {
+  if (!store) { sendJson(res, 501, { ok: false, error: 'work context store not available' }); return; }
+  const url = new URL(req.url || '/', 'http://localhost');
+  const headerSession = clientSessionId(req.headers);
+
+  if (path === '/teamclaude/context' && req.method === 'GET') {
+    const sessionId = url.searchParams.get('session_id') || headerSession;
+    sendJson(res, 200, { ok: true, context: sessionId ? store.get(sessionId) : null });
+    return;
+  }
+  if (path === '/teamclaude/context' && req.method === 'POST') {
+    let body;
+    try {
+      body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'invalid request body' });
+      return;
+    }
+    const sessionId = (typeof body.session_id === 'string' && body.session_id) || headerSession;
+    if (!sessionId) { sendJson(res, 400, { ok: false, error: 'missing session_id' }); return; }
+    const ctx = body.action === 'release' ? store.release(sessionId)
+      : body.action === 'claim' ? store.claim(sessionId, body)
+      : store.setContext(sessionId, body);
+    sendJson(res, 200, { ok: true, context: ctx });
+    return;
+  }
+  if (path === '/teamclaude/contexts' && req.method === 'GET') {
+    sendJson(res, 200, { ok: true, contexts: store.activeContexts() });
+    return;
+  }
+  if (path === '/teamclaude/usage' && req.method === 'GET') {
+    const groupBy = url.searchParams.get('group_by') || 'projectSlug';
+    const hours = Math.min(168, Math.max(1, parseInt(url.searchParams.get('hours') || '24', 10) || 24));
+    /** @type {{ projectSlug?: string, prdId?: number, beadId?: string }} */
+    const filters = {};
+    const projectSlug = url.searchParams.get('project_slug');
+    const prdId = url.searchParams.get('prd_id');
+    const beadId = url.searchParams.get('bead_id');
+    if (projectSlug) filters.projectSlug = projectSlug;
+    if (prdId) filters.prdId = parseInt(prdId, 10);
+    if (beadId) filters.beadId = beadId;
+    sendJson(res, 200, { ok: true, ...store.usageSummary({ groupBy, hours, filters }) });
+    return;
+  }
+  sendJson(res, 405, { ok: false, error: 'method not allowed' });
 }
 
 /**
@@ -1411,6 +1498,24 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
       const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // Book the same tokens against the work context the session declared
+      // through the teamclaude-work MCP server, when it declared one. Looked up
+      // once per request: a claim made mid-stream applies from the next one.
+      // A released context is kept (for GET /teamclaude/context) but books
+      // nothing: release_work means the session stopped working on that item.
+      // Summed here and written as ONE ledger event when the request ends: a
+      // stream reports usage at message_start and again at message_delta, and
+      // an event per report would count every streamed request twice.
+      const workContext = sessionId ? hooks.workContextStore?.get(sessionId) : null;
+      const workTokens = { input: 0, output: 0 };
+      if (workContext?.active) {
+        const bookClient = ctx.onUsage;
+        ctx.onUsage = (inputTokens, outputTokens) => {
+          bookClient?.(inputTokens, outputTokens);
+          workTokens.input += inputTokens || 0;
+          workTokens.output += outputTokens || 0;
+        };
+      }
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1462,6 +1567,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // would reclassify the worst failure as "the user left".
         accountManager.endSession(pinKey,
           !isCompletionPath(classificationPath(req.url)) ? null : (ctx.delivered ? true : (ctx.abandoned ? null : false)));
+        if (sessionId && workContext?.active && (workTokens.input || workTokens.output)) {
+          recordContextUsage(hooks.workContextStore, workContext, accountManager, ctx, sessionId, workTokens.input, workTokens.output);
+        }
         // Cleared BEFORE the hook, because the hook can throw: leaving the entry
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
@@ -3922,6 +4030,39 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
   } catch {
     // not valid JSON, skip
   }
+}
+
+// One ledger event per request, labelled with the work context the session
+// declared. `ctx.account` names the account that served: it is set as the
+// request is routed, and the last attempt is the one that answered.
+/**
+ * @param {any} store the WorkContextStore
+ * @param {Record<string, any>} workContext
+ * @param {any} accountManager
+ * @param {{ account: string|null, model?: string|null }} ctx
+ * @param {string} sessionId
+ * @param {number} inputTokens
+ * @param {number} outputTokens
+ */
+function recordContextUsage(store, workContext, accountManager, ctx, sessionId, inputTokens, outputTokens) {
+  const account = accountManager.accounts?.find((/** @type {{ name: string }} */ a) => a.name === ctx.account);
+  store.recordUsage({
+    timestamp: Date.now(),
+    sessionId,
+    accountName: ctx.account || '(unknown)',
+    accountIndex: account ? account.index : null,
+    model: ctx.model || null,
+    inputTokens: inputTokens || 0,
+    outputTokens: outputTokens || 0,
+    tenantSlug: workContext.tenantSlug,
+    projectSlug: workContext.projectSlug,
+    projectId: workContext.projectId,
+    prdId: workContext.prdId,
+    prNumber: workContext.prNumber,
+    beadId: workContext.beadId,
+    agentRef: workContext.agentRef,
+    rigName: workContext.rigName,
+  });
 }
 
 function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null) {

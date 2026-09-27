@@ -40,6 +40,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - Pools OpenAI Codex subscriptions alongside Claude accounts (experimental): the Codex CLI is routed through the same proxy, by config or transparently through the MITM proxy, and rotates on its own quota.
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
 - Sends one account's traffic through its own HTTP or SOCKS proxy (`login --routing "socks5h://user:pass@host:1080"`), sign-in and token refresh included, and leaves every other account alone. If that proxy goes down, the request fails over to the next account.
+- Attributes token spend to a [Switchyard](https://switchyard.work) work item (bead, PRD, PR) that a Claude Code agent claims through the `teamclaude-work` MCP server, and pushes the totals to Switchyard (`teamclaude switchyard login`, `teamclaude mcp install`). See [docs/switchyard.md](docs/switchyard.md).
 - No dependencies. Node built-ins only.
 
 ## Everyday commands
@@ -82,6 +83,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 | [Configuration](docs/configuration.md) | Config format, every field, environment variables, network tuning |
 | [Proxy modes](docs/proxy-modes.md) | MITM forward proxy, upstream proxy, per-account routing, sx.org residential egress |
 | [Compliance](docs/compliance.md) | Terms of service notes |
+| [Switchyard](docs/switchyard.md) | Token attribution to work items, the teamclaude-work MCP server, usage push |
 
 ## Security
 
