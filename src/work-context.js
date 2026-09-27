@@ -110,6 +110,9 @@ export class WorkContextStore {
     await chmod(this.usageLogPath, 0o600).catch(() => {});
   }
 
+  /**
+   * @param {{ groupBy?: string, hours?: number, filters?: { projectSlug?: string, prdId?: number, beadId?: string } }} [opts]
+   */
   usageSummary({ groupBy = 'projectSlug', hours = 24, filters = {} } = {}) {
     const cutoff = this._now() - hours * 60 * 60 * 1000;
     const buckets = new Map();

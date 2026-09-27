@@ -6,7 +6,22 @@ import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
-const SERVER_NAME = 'teamclaude';
+// Not plain 'teamclaude': upstream's docs register its own HTTP management MCP
+// (/teamclaude/mcp) under that name, and the two do different jobs.
+const SERVER_NAME = 'teamclaude-work';
+// The name earlier installs used. Removed only when it is this stdio server,
+// never when it is someone's HTTP registration of the management endpoint.
+const LEGACY_NAME = 'teamclaude';
+
+function isLegacyEntry(entry) {
+  return entry?.command === 'teamclaude' && Array.isArray(entry.args) && entry.args[0] === 'mcp';
+}
+
+function dropLegacy(servers) {
+  if (!isLegacyEntry(servers?.[LEGACY_NAME])) return false;
+  delete servers[LEGACY_NAME];
+  return true;
+}
 
 function getConfigPaths(scope) {
   if (scope === 'user') {
@@ -52,7 +67,7 @@ export async function installMcpServer(scope = 'user') {
   }
 
   config.mcpServers = config.mcpServers || {};
-  const existing = config.mcpServers[SERVER_NAME];
+  const existing = config.mcpServers[SERVER_NAME] || dropLegacy(config.mcpServers);
   config.mcpServers[SERVER_NAME] = makeServerEntry();
 
   await writeJson(path, config);
@@ -68,7 +83,8 @@ export async function uninstallMcpServer(scope = 'user') {
   const { path } = getConfigPaths(scope);
   const config = await readJson(path);
 
-  if (!config.mcpServers || !config.mcpServers[SERVER_NAME]) {
+  const hadLegacy = dropLegacy(config.mcpServers);
+  if (!config.mcpServers?.[SERVER_NAME] && !hadLegacy) {
     return { scope, path, action: 'not-found' };
   }
 
@@ -83,7 +99,7 @@ export async function uninstallMcpServer(scope = 'user') {
 
 export function renderInstallResult(result) {
   if (result.action === 'not-found') {
-    return `TeamClaude MCP server was not registered in ${result.path}`;
+    return `The ${SERVER_NAME} MCP server was not registered in ${result.path}`;
   }
-  return `TeamClaude MCP server ${result.action} in ${result.scope} scope: ${result.path}\nReload Claude Code tools with /mcp`;
+  return `The ${SERVER_NAME} MCP server ${result.action} in ${result.scope} scope: ${result.path}\nReload Claude Code tools with /mcp`;
 }

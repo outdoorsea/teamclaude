@@ -103,7 +103,7 @@ A user opts in by adding the MCP server to their Claude Code / Gas City config:
 ```json
 {
   "mcpServers": {
-    "teamclaude": {
+    "teamclaude-work": {
       "command": "teamclaude",
       "args": ["mcp"]
     }

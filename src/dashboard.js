@@ -1,11 +1,3 @@
-// ── WEB DASHBOARD, ported from upstream ─────────────────────────────
-// Served at /teamclaude/dashboard; `/` and the old /dashboard route redirect to it.
-//
-// Upstream's file, plus the light-theme change on the feat/dashboard-theme
-// branch (dashboardCsp hashing every inline script, the light palette, the
-// <head> script that applies the stored choice, and the Theme button). Nothing
-// else is altered, so a diff against upstream still shows only that change.
-//
 // The status dashboard: a single self-contained HTML page served at
 // GET /teamclaude/dashboard, rendering /teamclaude/status for humans.
 //
@@ -24,24 +16,12 @@
 
 import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
+import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
   return PAGE;
 }
 
-/**
- * Content-Security-Policy for the dashboard, sent by the server with the page.
- *
- * The page holds the proxy key in localStorage, so the policy is the backstop
- * for a script that should never run there: nothing loads from anywhere
- * (`default-src 'none'`), the one inline script is admitted by its hash rather
- * than by `'unsafe-inline'` — the page is static, so the hash is stable — and
- * the only network the script may touch is this origin, for status and switch.
- * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
- * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
- * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
- * another site's iframe, where a click on "switch" could be overlaid.
- */
 /**
  * The body of every `<script>` in the page, in order. Attribute-free tags only,
  * which is all this page has and all the hash policy can admit anyway.
@@ -56,6 +36,20 @@ export function inlineScripts(html) {
   return out;
 }
 
+/**
+ * Content-Security-Policy for the dashboard, sent by the server with the page.
+ *
+ * The page holds the proxy key in localStorage, so the policy is the backstop
+ * for a script that should never run there: nothing loads from anywhere
+ * (`default-src 'none'`), each inline script (the theme bootstrap in `<head>`
+ * and the main script) is admitted by its hash rather than by
+ * `'unsafe-inline'` — the page is static, so the hashes are stable — and the
+ * only network the script may touch is this origin, for status and switch.
+ * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
+ * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
+ * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
+ * another site's iframe, where a click on "switch" could be overlaid.
+ */
 export function dashboardCsp(html = PAGE) {
   // Every inline script, not just the first: the theme is applied by a short
   // script in <head> so the page does not paint dark and then flip to light,
@@ -237,6 +231,14 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // or the comparison falls back to thresholdBadgeText's own 0.98 default.
   var thresholdText = thresholdBadgeText(a.switchThreshold, fleetThreshold, fleetThresholds);
   if (thresholdText) badges.push({ cls: 'meta threshold', text: thresholdText });
+  // Extra-usage fallback: one badge, the louder state winning. Strict `true`
+  // so a missing field on an older server's payload shows nothing.
+  if (a.onExtraUsage === true) badges.push({ cls: 'extra-usage billing', text: 'on extra usage \u2014 billing' });
+  else if (a.allowExtraUsage === true) badges.push({ cls: 'extra-usage', text: 'extra usage allowed' });
+  // The account's own egress proxy, as the status payload carries it: already
+  // password-masked (describeRouting), and absent for an account on the fleet
+  // path, which is the default and earns no badge.
+  if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
   return badges;
 }
 
@@ -318,133 +320,6 @@ export function uniqSorted(values) {
 // The request the switch button sends: POST /teamclaude/switch with the same
 // key the status poll uses. Pure, so the test suite can send exactly this
 // through a real proxy and prove the same-origin CSRF gate lets the page in.
-/**
- * Everything currently holding an account back, each with the scope it holds.
- *
- * Availability is per model, exactly as the server computes it: the shared 5h
- * bucket, a pause and a 429 stop every request, while a weekly bucket stops
- * only the models it governs. Fable and Sonnet meter their own weekly quota, so
- * a spent Fable bucket bars Fable alone and the account keeps serving
- * everything else — which is the failover the pool relies on.
- *
- * `threshold` is the fleet's switchThreshold: the point at which the proxy
- * stops selecting the account, whatever the upstream would still accept. 0.98
- * is the server's own default.
- */
-export function accountHolds(account, now, threshold) {
-  var limit = typeof threshold === 'number' && threshold > 0 ? threshold : 0.98;
-  var holds = [];
-  var q = (account && account.quota) || {};
-  // getStatus sends these two as ISO strings and the quota resets as epoch
-  // numbers, so they are parsed rather than compared as they arrive — a string
-  // compared against a number is quietly always false, and the hold would
-  // simply never be reported.
-  var at = function (v) {
-    if (v == null) return NaN;
-    return typeof v === 'number' ? v : Date.parse(v);
-  };
-  var rl = at(account && account.rateLimitedUntil);
-  var pu = at(account && account.pausedUntil);
-  if (rl > now) holds.push({ at: rl, reason: 'upstream 429 hold', scope: 'all' });
-  if (pu > now) holds.push({ at: pu, reason: 'paused', scope: 'all' });
-  if (q.unified5h != null && q.unified5h >= limit && at(q.unified5hReset) > now) {
-    holds.push({ at: at(q.unified5hReset), reason: '5h quota', scope: 'all' });
-  }
-  // The general weekly governs every model that does not meter its own. When a
-  // family bucket is absent the server falls back to this one, so an account
-  // with no Fable bucket is held for Fable by this hold too.
-  if (q.unified7d != null && q.unified7d >= limit && at(q.unified7dReset) > now) {
-    holds.push({ at: at(q.unified7dReset), reason: 'weekly quota', scope: q.unified7dFable == null && q.unified7dSonnet == null ? 'all' : 'general' });
-  }
-  if (q.unified7dFable != null && q.unified7dFable >= limit && at(q.unified7dFableReset) > now) {
-    holds.push({ at: at(q.unified7dFableReset), reason: 'Fable weekly quota', scope: 'fable' });
-  }
-  if (q.unified7dSonnet != null && q.unified7dSonnet >= limit && at(q.unified7dSonnetReset) > now) {
-    holds.push({ at: at(q.unified7dSonnetReset), reason: 'Sonnet weekly quota', scope: 'sonnet' });
-  }
-  return holds;
-}
-
-/**
- * The soonest hold that stops EVERY model, or null when the account can still
- * serve something. This is what "unavailable" has to mean: an account out of
- * its Fable allowance is not out of the pool, it is out for Fable, and filing
- * it under unavailable would contradict the routing table on the same page.
- */
-export function availabilityAt(account, now, threshold) {
-  var blocking = accountHolds(account, now, threshold).filter(function (h) { return h.scope === 'all'; });
-  if (!blocking.length) return null;
-  return blocking.reduce(function (a, b) { return b.at < a.at ? b : a; });
-}
-
-/**
- * A countdown, coarsening as it lengthens: seconds matter when the wait is
- * nearly over and are noise when it is hours away, and a ticker that only ever
- * changed its seconds digit would read as the only thing happening on the page.
- */
-export function formatCountdown(ms) {
-  if (!(ms > 0)) return 'now';
-  var s = Math.floor(ms / 1000);
-  var d = Math.floor(s / 86400);
-  var h = Math.floor((s % 86400) / 3600);
-  var m = Math.floor((s % 3600) / 60);
-  var sec = s % 60;
-  if (d > 0) return d + 'd ' + h + 'h';
-  if (h > 0) return h + 'h ' + m + 'm';
-  if (m > 0) return m + 'm ' + sec + 's';
-  return sec + 's';
-}
-
-/**
- * The three ways an account can stand relative to the pool, in draw order.
- *
- *   live  — rotation can select it now
- *   held  — it cannot serve until something resets: a spent quota window, an
- *           upstream 429, or a pause. Temporary, and it says when it is back.
- *   off   — the operator disabled it. Indefinite, and only they can undo it.
- *
- * held and off are kept apart because they are different questions. "Wait" and
- * "someone turned this off" look identical in a single greyed-out list, and the
- * operator's next action is completely different for each.
- *
- * Stable within each group, so live accounts keep the order the server sent,
- * which is the rotation order.
- */
-export function groupAccounts(accounts, now, threshold) {
-  var live = [];
-  var held = [];
-  var off = [];
-  (accounts || []).forEach(function (a) {
-    if (a && a.disabled) off.push(a);
-    else if (availabilityAt(a, now, threshold)) held.push(a);
-    else live.push(a);
-  });
-  return { live: live, held: held, off: off };
-}
-
-/**
- * Per-model usage rows for one account, busiest first.
- *
- * The fleet's quota is metered per model family, but until now nothing said
- * which models were actually being run — only that some family bucket was
- * filling. This is that, counted as the responses land.
- */
-export function modelRows(usage) {
-  var by = (usage && usage.byModel) || {};
-  return Object.keys(by).map(function (name) {
-    var v = by[name] || {};
-    return {
-      model: name,
-      requests: v.requests || 0,
-      tokens: (v.inputTokens || 0) + (v.outputTokens || 0),
-      inputTokens: v.inputTokens || 0,
-      outputTokens: v.outputTokens || 0,
-    };
-  }).sort(function (a, b) {
-    return b.tokens - a.tokens || b.requests - a.requests || (a.model < b.model ? -1 : 1);
-  });
-}
-
 export function switchRequest(name, key) {
   return {
     url: '/teamclaude/switch',
@@ -454,6 +329,52 @@ export function switchRequest(name, key) {
       body: JSON.stringify({ account: name }),
     },
   };
+}
+
+// The request the threshold control sends. The number goes as typed: what
+// counts as a percentage is the server's rule (1–100, kept to tenths), and a
+// second opinion here would only disagree with it on the edges.
+/**
+ * @param {number|string} percent
+ * @param {string|null|undefined} key
+ */
+export function thresholdRequest(percent, key) {
+  return {
+    url: '/teamclaude/threshold',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ percent: percent }),
+    },
+  };
+}
+
+// The stored 0–1 ratio as the number the control shows. Tenths, and no trailing
+// zero: the setting is quantised to tenths of a percent, so 0.98 must read back
+// as "98" rather than "98.0" for a re-save to be a no-op the operator can see.
+/** @param {unknown} value */
+export function thresholdPercentText(value) {
+  /** @type {any} */ var ratio = value;
+  // A per-bucket table: the control sets one number for every bucket, so what it
+  // shows is the default the table falls back to.
+  if (ratio && typeof ratio === 'object' && !Array.isArray(ratio)) ratio = ratio.default;
+  if (typeof ratio !== 'number' || !isFinite(ratio)) return '';
+  return String(Math.round(ratio * 1000) / 10);
+}
+
+// What to tell the operator after a threshold change. `dropped` is the part a
+// bare "saved" would hide: one number replaces a per-bucket table rather than
+// hiding one behind it, and the operator who set those buckets should hear it.
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function thresholdOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'threshold change failed' + (res && res.error ? ': ' + res.error : '') };
+  var pct = thresholdPercentText(res.switchThreshold);
+  var dropped = res.dropped || [];
+  if (dropped.length) return { kind: 'warn', text: 'switch threshold set to ' + pct + '% — dropped the per-bucket thresholds (' + dropped.join(', ') + ')' };
+  return { kind: 'ok', text: 'switch threshold set to ' + pct + '%' };
 }
 
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
@@ -663,10 +584,33 @@ export function problems(status) {
   return out;
 }
 
+// The usage views the page offers, derived from the windows the tracker
+// actually keeps rather than listed again here: a window added or renamed in
+// client-usage.js must not leave a button behind that reads zero for everyone.
+// `total` is first because it is the lifetime counter the status payload has
+// always carried, and the view the page opens on.
+export const USAGE_VIEWS = [{ key: 'total', label: 'Total' }].concat(
+  Object.keys(USAGE_WINDOWS).map(key => ({ key, label: 'Last ' + key })));
+
+// Which counters one usage row shows. Every usage table reads the selected
+// window through this, rather than each renderer reaching into `windows`
+// itself — the Clients table and the per-dimension tables carry the same shape
+// and must not drift into answering the same question differently.
+/** @param {any} entry @param {string} [view] */
+export function usageFor(entry, view) {
+  var e = entry || {};
+  var src = !view || view === 'total' ? e : ((e.windows || {})[view] || {});
+  return {
+    requests: src.requests || 0,
+    connections: src.connections || 0,
+    inputTokens: src.inputTokens || 0,
+    outputTokens: src.outputTokens || 0,
+  };
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, groupAccounts, modelRows,
-  accountHolds, availabilityAt, formatCountdown, routeRows, problems,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -680,6 +624,7 @@ const SHARED_CONSTS = [
   `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
+  `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -735,6 +680,8 @@ const PAGE = `<!doctype html>
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
+  .badge.extra-usage { color: var(--warn); border-color: var(--warn); }
+  .badge.extra-usage.billing { color: var(--bad); border-color: var(--bad); }
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -749,33 +696,7 @@ const PAGE = `<!doctype html>
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
-  .models { margin-top: 4px; }
-  .mrow { display: flex; gap: 8px; font-size: 12px; color: var(--dim); }
-  .mname { color: var(--text); font-variant-numeric: tabular-nums; }
-  .mval { margin-left: auto; font-variant-numeric: tabular-nums; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
-  .ticker { color: var(--warn); font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
-  .ticker.partial { color: var(--dim); }
-  #current .who { font-size: 16px; font-weight: 600; }
-  #current .row { margin-bottom: 2px; }
-  .ticker b { color: var(--text); font-weight: 600; }
-  /* A disabled account is drawn as a ghost of a card: it is still there, still
-     identifiable, and clearly not in play. The dimming is applied to the card's
-     CONTENTS rather than the card, because opacity on the card would create a
-     stacking context its children cannot escape — the enable button would fade
-     with everything else, and that button is the one thing here that must stay
-     legible and obviously clickable. */
-  /* Two ways to be out of the pool, drawn differently on purpose.
-     "held" is waiting: it comes back by itself, so the card stays fully legible
-     and is marked with the warn colour that the countdown and the spent bar
-     already use — nothing is dimmed, because the operator is reading it, not
-     dismissing it.
-     "off" is switched off: indefinite, and only the operator undoes it, so the
-     card is ghosted and only the way back in stays bright. */
-  .card.held { border-left: 3px solid var(--warn); }
-  .card.off { background: transparent; border-style: dashed; }
-  .card.off > *:not(.row) { opacity: .45; }
-  .card.off .row > *:not(.primary) { opacity: .45; }
   .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
   .act:hover { background: var(--accent); color: var(--bg); }
   .act:disabled { opacity: .5; cursor: default; }
@@ -789,6 +710,13 @@ const PAGE = `<!doctype html>
   .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
   .actions button:hover { color: var(--text); border-color: var(--text); }
   .actions button:disabled { opacity: .5; cursor: default; }
+  .actions button.sel { color: var(--text); border-color: var(--accent); }
+  .actions .lbl { color: var(--dim); font-size: 12px; align-self: center; }
+  /* Pushed to the far end: the two buttons on the left act on the fleet as it
+     stands, while this one edits a stored setting — a gap says so without a
+     second row. */
+  .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
+  .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -804,7 +732,7 @@ const PAGE = `<!doctype html>
   #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
-  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
+  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
 </style>
 <script>
@@ -831,6 +759,12 @@ const PAGE = `<!doctype html>
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
       <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
+      <span class="thr">
+        <label for="thrVal">Switch at</label>
+        <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
+        <span>%</span>
+        <button id="thrSet" type="button">Set</button>
+      </span>
     </div>
     <div id="err"></div>
     <div id="problems"></div>
@@ -839,22 +773,11 @@ const PAGE = `<!doctype html>
       <h2>Routing</h2>
       <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
     </div>
-    <div id="currentWrap" style="display:none">
-      <h2>Current account</h2>
-      <div class="card" id="current"></div>
-    </div>
     <h2>Accounts</h2>
     <div id="accounts"></div>
-    <div id="heldWrap" style="display:none">
-      <h2>Unavailable</h2>
-      <div id="held"></div>
-    </div>
-    <div id="offWrap" style="display:none">
-      <h2>Disabled</h2>
-      <div id="off"></div>
-    </div>
+    <div id="usageViewWrap" class="actions" style="display:none"></div>
     <div id="clientsWrap" style="display:none">
-      <h2>Clients</h2>
+      <h2 id="clientsHeading">Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
     </div>
     <div id="dimensionsWrap"></div>
@@ -879,10 +802,15 @@ const PAGE = `<!doctype html>
   var THEME_KEY = 'teamclaude-dashboard-theme';
   var POLL_MS = 5000;
   var timer = null;
-  var tick = null;
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
+  // The usage window applies to every table the usage trackers feed (Clients
+  // and each configured dimension), so it is page state rather than per-table:
+  // two controls left on different windows would invite reading one table's
+  // number against the other's. Like the sort, it survives the poll.
+  var usageView = 'total';
+  var usageButtons = [];
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_CONSTS}
@@ -961,40 +889,8 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  // The account traffic is on right now, called out above the full list. The
-  // summary line names it too, but in a sentence; an operator watching a
-  // rotation wants it where the eye lands, next to whether it is actually able
-  // to serve. Hidden rather than empty when nothing is current, so the heading
-  // never stands over a blank card.
-  function renderCurrent(s, currentAccounts) {
-    var wrap = document.getElementById('currentWrap');
-    var box = document.getElementById('current');
-    box.textContent = '';
-    var chosen = currentAccountsOf(s, currentAccounts);
-    if (!chosen.length) { wrap.style.display = 'none'; return; }
-    wrap.style.display = '';
-    // The whole card, not a summary of it: this is now the ONLY place the
-    // current account is drawn, so anything left out here would be a control
-    // the operator no longer has.
-    chosen.forEach(function (a) {
-      box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds));
-    });
-  }
-
-  // The accounts the server is currently serving from — one per provider on a
-  // mixed fleet, otherwise the single currentAccount.
-  function currentAccountsOf(s, currentAccounts) {
-    var names = currentAccounts
-      ? Object.keys(currentAccounts).map(function (k) { return currentAccounts[k]; })
-      : (s.currentAccount ? [s.currentAccount] : []);
-    return (s.accounts || []).filter(function (a) { return names.indexOf(a.name) !== -1; });
-  }
-
   function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
-    var cls = a.disabled ? 'card off'
-      : availabilityAt(a, Date.now(), fleetThreshold) ? 'card held'
-      : 'card';
-    var card = el('div', cls);
+    var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
     var isCurrent = currentAccounts
@@ -1009,12 +905,14 @@ ${SHARED_HELPERS}
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
     }
+    // Account controls, in the order an operator reaches for them: take it out
+    // of rotation, or move where rotation reaches it. Only the enable/disable
+    // control is shown for a disabled account — the rest would be moving an
+    // account that nothing will select anyway.
     // Named ctl* deliberately: var is function-scoped, and this builder already
     // declares a "last" further down (the last-used string). A button named
     // last here is overwritten by that before any click can fire.
-    // The "primary" class is what the ghosting rule spares: on a disabled card
-    // every other control dims with the rest of it, and the way back in does not.
-    var ctlDisable = el('button', a.disabled ? 'act primary' : 'act', a.disabled ? 'enable' : 'disable');
+    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
     ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
     head.appendChild(ctlDisable);
     if (!a.disabled) {
@@ -1027,19 +925,6 @@ ${SHARED_HELPERS}
     }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
-    // A held account gets a live countdown to the moment it can serve again.
-    // The timestamp is put on the node so the one-second tick can retime it
-    // without re-rendering the card, which would fight the five-second poll.
-    // One line per hold. An account out of its Fable allowance is still in the
-    // pool for everything else, so the line names what is stopped rather than
-    // implying the account is gone.
-    accountHolds(a, Date.now(), fleetThreshold).forEach(function (h) {
-      var tick = el('div', h.scope === 'all' ? 'ticker' : 'ticker partial');
-      tick.setAttribute('data-until', String(h.at));
-      tick.setAttribute('data-reason', h.scope === 'all' ? h.reason : h.reason + ' (other models unaffected)');
-      retime(tick);
-      card.appendChild(tick);
-    });
     var q = a.quota || {};
     if (q.unified5h != null || q.unified7d != null) {
       card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
@@ -1056,21 +941,24 @@ ${SHARED_HELPERS}
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
-    // What this account actually ran, when anything has run on it. Absent
-    // rather than an empty table on an account that has served nothing this
-    // session — the counters start at process start, not at account creation.
-    var models = modelRows(u);
-    if (models.length) {
-      var mt = el('div', 'models');
-      models.forEach(function (r) {
-        var row = el('div', 'mrow');
-        row.appendChild(el('span', 'mname', r.model));
-        row.appendChild(el('span', 'mval', r.requests + ' req · ' + fmtNum(r.tokens) + ' tok'));
-        mt.appendChild(row);
-      });
-      card.appendChild(mt);
-    }
     return card;
+  }
+
+  // The window a usage table is showing, in its own heading. The control sits
+  // above the Clients table, but the dimension tables are below it and can be
+  // scrolled clear of it — and a five-hour figure under a bare "Input tok" is
+  // the one way this feature can state a number under the wrong label.
+  // Last used is a lifetime figure in a table whose heading may name a window.
+  // Under Total that needs no saying; under a window it does, or it reads as
+  // the one thing this control must never do — a number under the wrong label.
+  function lastUsedLabel() {
+    return usageView === 'total' ? 'Last used' : 'Last used (all time)';
+  }
+
+  function usageHeading(base) {
+    if (usageView === 'total') return base;
+    var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
+    return view ? base + ' · ' + view.label.toLowerCase() : base;
   }
 
   function renderClients(clients) {
@@ -1078,28 +966,58 @@ ${SHARED_HELPERS}
     var names = Object.keys(clients || {});
     if (!names.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
+    document.getElementById('clientsHeading').textContent = usageHeading('Clients');
+    // Sorted on the window being shown, not on the lifetime total: a table
+    // ordered by all-time spend while displaying the last five hours would put
+    // the quiet clients on top of the busy one.
     names.sort(function (a, b) {
-      var ca = clients[a], cb = clients[b];
-      return ((cb.inputTokens || 0) + (cb.outputTokens || 0)) - ((ca.inputTokens || 0) + (ca.outputTokens || 0));
+      var ua = usageFor(clients[a], usageView), ub = usageFor(clients[b], usageView);
+      return (ub.inputTokens + ub.outputTokens) - (ua.inputTokens + ua.outputTokens);
     });
     var table = document.getElementById('clients');
     table.textContent = '';
     var hr = el('tr');
-    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', lastUsedLabel()].forEach(function (h, i) {
       hr.appendChild(el('th', i ? 'num' : '', h));
     });
     table.appendChild(hr);
     names.forEach(function (n) {
       var c = clients[n];
+      var u = usageFor(c, usageView);
       var tr = el('tr');
       tr.appendChild(el('td', '', n));
-      tr.appendChild(el('td', 'num', fmtNum(c.requests)));
-      tr.appendChild(el('td', 'num', fmtNum(c.connections || 0)));
-      tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
-      tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(u.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(u.connections)));
+      tr.appendChild(el('td', 'num', fmtNum(u.inputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(u.outputTokens)));
+      // Last used stays the lifetime figure under every window: it answers
+      // when this client was last seen at all, which a window cannot.
       tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
       table.appendChild(tr);
     });
+  }
+
+  // The window buttons, built once: the windows are fixed by the server that
+  // served this page. Visibility is decided per render, since the control only
+  // means something when there is a usage table under it.
+  function buildUsageViews() {
+    var wrap = document.getElementById('usageViewWrap');
+    wrap.appendChild(el('span', 'lbl', 'Usage window'));
+    USAGE_VIEWS.forEach(function (v) {
+      var btn = el('button', '', v.label);
+      btn.addEventListener('click', function () {
+        usageView = v.key;
+        markUsageView();
+        if (lastStatus) render(lastStatus);
+      });
+      wrap.appendChild(btn);
+      usageButtons.push({ key: v.key, btn: btn });
+    });
+    markUsageView();
+  }
+
+  function markUsageView() {
+    usageButtons.forEach(function (b) { b.btn.className = b.key === usageView ? 'sel' : ''; });
   }
 
   // Header cells that re-sort in place. The sort is state, not a re-fetch, so
@@ -1196,11 +1114,12 @@ ${SHARED_HELPERS}
       var entries = dimensions[name] || {};
       var rows = Object.keys(entries).map(function (key) {
         var e = entries[key] || {};
+        var u = usageFor(e, usageView);
         return {
           name: key,
-          requests: e.requests || 0,
-          inputTokens: e.inputTokens || 0,
-          outputTokens: e.outputTokens || 0,
+          requests: u.requests,
+          inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens,
           lastUsed: e.lastUsed ? Date.parse(e.lastUsed) : 0,
         };
       });
@@ -1208,7 +1127,7 @@ ${SHARED_HELPERS}
       sortState[name] = sortState[name] || { key: 'inputTokens', dir: 'desc' };
       rows = sortRows(rows, sortState[name].key, sortState[name].dir);
 
-      wrap.appendChild(el('h2', '', name.charAt(0).toUpperCase() + name.slice(1)));
+      wrap.appendChild(el('h2', '', usageHeading(name.charAt(0).toUpperCase() + name.slice(1))));
       var card = el('div', 'card');
       card.style.padding = '4px 6px';
       var table = el('table');
@@ -1217,7 +1136,7 @@ ${SHARED_HELPERS}
         { key: 'requests', label: 'Req', num: true },
         { key: 'inputTokens', label: 'Input tok', num: true },
         { key: 'outputTokens', label: 'Output tok', num: true },
-        { key: 'lastUsed', label: 'Last used', num: true }].forEach(function (c) {
+        { key: 'lastUsed', label: lastUsedLabel(), num: true }].forEach(function (c) {
         addSortableHeader(hr, name, c.label, c.key, !!c.num);
       });
       table.appendChild(hr);
@@ -1289,6 +1208,12 @@ ${SHARED_HELPERS}
 
   function render(s) {
     lastStatus = s;
+    // The poll owns the threshold field except while it is being typed into:
+    // rewriting it every POLL_MS would delete the operator's half-entered
+    // number under the cursor. It also means a change made from the CLI, the
+    // TUI or another browser shows up here without a refresh.
+    var thrInput = document.getElementById('thrVal');
+    if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -1317,26 +1242,17 @@ ${SHARED_HELPERS}
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
-    renderCurrent(s, currentAccounts);
-    // Drawn in its own panel above, so it is not repeated here.
-    var shown = currentAccountsOf(s, currentAccounts).map(function (a) { return a.name; });
-    var rest = (s.accounts || []).filter(function (a) { return shown.indexOf(a.name) === -1; });
-    var groups = groupAccounts(rest, Date.now(), s.switchThreshold);
-    [['accounts', groups.live, null], ['held', groups.held, 'heldWrap'], ['off', groups.off, 'offWrap']]
-      .forEach(function (g) {
-        var box = document.getElementById(g[0]);
-        box.textContent = '';
-        g[1].forEach(function (a) {
-          box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds));
-        });
-        // The heading belongs to the section, so an empty group takes its
-        // heading with it rather than standing over nothing.
-        if (g[2]) document.getElementById(g[2]).style.display = g[1].length ? '' : 'none';
-      });
+    var acc = document.getElementById('accounts');
+    acc.textContent = '';
+    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
+    // The control means nothing with no usage table under it. The payload
+    // already answers that: the server omits a dimension with no entries.
+    var anyUsage = Object.keys(s.clients || {}).length || Object.keys(s.usageDimensions || {}).length;
+    document.getElementById('usageViewWrap').style.display = anyUsage ? '' : 'none';
     renderSessions(s.sessions);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
@@ -1371,36 +1287,6 @@ ${SHARED_HELPERS}
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
   }
 
-  // Rewrite one countdown from its stored deadline. Reading the deadline off
-  // the node rather than closing over it means the tick does not care which
-  // render produced the element, so a poll landing mid-second cannot leave a
-  // stale closure updating a node that is no longer on the page.
-  function retime(node) {
-    var until = Number(node.getAttribute('data-until'));
-    var reason = node.getAttribute('data-reason') || 'held';
-    var left = until - Date.now();
-    if (left <= 0) {
-      node.textContent = '';
-      node.appendChild(document.createTextNode(reason + ' — '));
-      node.appendChild(el('b', '', 'available now'));
-      return;
-    }
-    node.textContent = '';
-    node.appendChild(document.createTextNode(reason + ' — back in '));
-    node.appendChild(el('b', '', formatCountdown(left)));
-  }
-
-  // One second, independent of the five-second poll: a countdown that only
-  // moved when the poll landed would sit still for seconds at a time. Held by a
-  // handle like the poll is, so the key prompt stops both rather than leaving
-  // this one running behind it.
-  function retimeAll() {
-    var nodes = document.querySelectorAll('[data-until]');
-    for (var i = 0; i < nodes.length; i++) retime(nodes[i]);
-  }
-  function startTick() { if (!tick) tick = setInterval(retimeAll, 1000); }
-  function stopTick() { if (tick) { clearInterval(tick); tick = null; } }
-
   function doControlAccount(name, spec, btn) {
     btn.disabled = true;
     var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
@@ -1419,6 +1305,38 @@ ${SHARED_HELPERS}
       // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
       // above, and a button that stayed dead after a refused change would be
       // the only control an operator could not retry.
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // The one control here that writes a setting rather than nudging the running
+  // fleet: the server saves it to the config file and reloads, so it holds
+  // across a restart. One number governs every quota bucket — a fleet using
+  // per-bucket thresholds is told what the save dropped (thresholdOutcome).
+  function doThreshold(btn) {
+    var input = document.getElementById('thrVal');
+    var raw = input.value.trim();
+    // Left to the server otherwise: an empty field is the one case it would see
+    // as a missing key rather than a bad number, and "invalid request body" is
+    // not what an operator who cleared the box needs to read.
+    if (!raw) { note('error', 'switch threshold: enter a percentage from 1 to 100'); return; }
+    btn.disabled = true;
+    var r = thresholdRequest(Number(raw), localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = thresholdOutcome(json);
+        note(out.kind, out.text);
+        // The stored number, not the typed one: the setting is quantised to
+        // tenths, and a field left reading 97.55 after a save of 97.6 invites a
+        // re-save that changes nothing.
+        if (json.ok) input.value = thresholdPercentText(json.switchThreshold);
+        poll();
+      })
+      .catch(function (e) { note('error', 'switch threshold change failed: ' + e.message); })
       .finally(function () { btn.disabled = false; });
   }
 
@@ -1441,18 +1359,12 @@ ${SHARED_HELPERS}
 
   function showKeybox() {
     if (timer) { clearInterval(timer); timer = null; }
-    stopTick();
     document.getElementById('app').style.display = 'none';
     document.getElementById('keybox').style.display = 'block';
     document.getElementById('key').focus();
   }
 
   function poll() {
-    // Nobody is looking at a hidden tab, and browsers throttle its timers
-    // unevenly anyway. Skipping the request rather than clearing the interval
-    // keeps one code path: becoming visible polls at once, so what comes back
-    // into view is current rather than however stale the last tick left it.
-    if (document.hidden) return;
     fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
@@ -1482,14 +1394,7 @@ ${SHARED_HELPERS}
   function start() {
     poll();
     if (!timer) timer = setInterval(poll, POLL_MS);
-    startTick();
   }
-
-  document.addEventListener('visibilitychange', function () {
-    if (document.hidden || !timer) return;
-    poll();
-    retimeAll();
-  });
 
   document.getElementById('go').addEventListener('click', function () {
     var v = document.getElementById('key').value.trim();
@@ -1525,15 +1430,24 @@ ${SHARED_HELPERS}
       else localStorage.setItem(THEME_KEY, theme);
     } catch (e) { /* storage disabled: the choice lasts for this page only */ }
   }
-  applyTheme(readTheme());
+  // The current theme lives in a variable rather than being re-read from
+  // storage on each click: with storage blocked, readTheme() would always say
+  // 'system' and the button would be stuck on 'light' instead of cycling.
+  var theme = readTheme();
+  applyTheme(theme);
   document.getElementById('theme').addEventListener('click', function () {
-    var next = THEMES[(THEMES.indexOf(readTheme()) + 1) % THEMES.length];
-    storeTheme(next);
-    applyTheme(next);
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    storeTheme(theme);
+    applyTheme(theme);
   });
 
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
+  document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('thrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('thrSet').click();
+  });
+  buildUsageViews();
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {

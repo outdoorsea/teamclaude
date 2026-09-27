@@ -5,9 +5,9 @@
 [![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
+Multi-account proxy for [Claude Code](https://claude.ai/claude-code) and [Codex](https://github.com/openai/codex): it pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota.
 
-It sits between Claude Code and the Anthropic API, holds several Claude Max (or API key) accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429.
+It sits between the coding agent and the provider's API, holds several accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429. Claude accounts serve Claude Code, Codex accounts serve the Codex CLI, and both pools share one proxy.
 
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
@@ -23,7 +23,7 @@ teamclaude server    # start the proxy, shows the TUI
 teamclaude run       # in another terminal: Claude Code through the proxy
 ```
 
-Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
+Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. A container image is on GHCR — see [Running in a container](docs/usage.md#running-in-a-container). API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
 ## What it does
 
@@ -32,13 +32,15 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - Tells a spent quota bucket apart from a per-minute rate limit and only rotates on the first one. Rotating on a rate limit would just move the burst to the next account and drop the warm cache, so it paces the same account instead.
 - Paces requests onto a freshly switched account, so a herd of agents failing over at the same instant doesn't throttle it and cascade down the fleet.
 - TUI with quota bars, reset countdowns, activity log, and settings you can change while it runs, including adding and removing accounts.
-- Web dashboard (`teamclaude attach` or `http://localhost:3456/teamclaude/dashboard`) for live status, account switching, and controls when the server runs headless.
-- MCP server (`teamclaude mcp`) that lets Claude Code agents claim work items, so token usage can be attributed to a project, PRD, PR, or bead.
-- Switchyard integration (`teamclaude switchyard login`) that pushes attributed token usage to Switchyard for billing and cost visibility.
+- Opt-in MCP endpoint that hands the same control plane to Claude Code as tools, so an agent can read the fleet's quota or switch accounts from inside a session.
 - Catches hardcoded `api.anthropic.com` endpoints (the Claude Design MCP, for one) through a local MITM forward proxy, not only what `ANTHROPIC_BASE_URL` covers.
 - Holds the request open until quota resets instead of returning 429 when every account is spent, so an unattended run finishes on its own (`holdSeconds`, off by default).
+- Optionally leans on accounts with Anthropic's paid extra usage once every account is out of free quota, instead of returning 429 (`allowExtraUsage`, off by default — it bills real money). Quota between the switch threshold and 100% is used first, on any account; billing starts only when none is left, and stops as soon as a window resets.
 - Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
+- Pools OpenAI Codex subscriptions alongside Claude accounts (experimental): the Codex CLI is routed through the same proxy, by config or transparently through the MITM proxy, and rotates on its own quota.
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
+- Sends one account's traffic through its own HTTP or SOCKS proxy (`login --routing "socks5h://user:pass@host:1080"`), sign-in and token refresh included, and leaves every other account alone. If that proxy goes down, the request fails over to the next account.
+- Attributes token spend to a [Switchyard](https://switchyard.work) work item (bead, PRD, PR) that a Claude Code agent claims through the `teamclaude-work` MCP server, and pushes the totals to Switchyard (`teamclaude switchyard login`, `teamclaude mcp install`). See [docs/switchyard.md](docs/switchyard.md).
 - No dependencies. Node built-ins only.
 
 ## Everyday commands
@@ -48,25 +50,11 @@ teamclaude accounts          # accounts with tier and token status
 teamclaude status            # live proxy status, needs a running server
 teamclaude disable <name>    # pause an account without removing it
 teamclaude priority <name> 1 # rotation order, lower = preferred
-teamclaude attach            # open the web dashboard against a running server
 teamclaude alias --install   # make plain `claude` go through the proxy
 teamclaude help              # everything else
 ```
 
 Full reference: [docs/usage.md](docs/usage.md).
-
-## Switchyard integration
-
-If you use [Switchyard](https://switchyard.work), TeamClaude can attribute Claude API spend to the work item that caused it:
-
-```bash
-teamclaude switchyard login  # browser OAuth to switchyard.work
-teamclaude mcp install       # register the TeamClaude MCP server with Claude Code
-```
-
-Once registered, a Claude Code agent can call the `claim_work` MCP tool with a bead/PRD/PR. TeamClaude meters the session and pushes token totals to Switchyard every `switchyard.usageIntervalSeconds`.
-
-Full details: [docs/switchyard.md](docs/switchyard.md).
 
 ## Configuration
 
@@ -88,14 +76,14 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 
 | Page | Contents |
 | --- | --- |
-| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, third-party backends |
-| [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, logging |
+| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, per-account proxy routing, Codex accounts, third-party backends |
+| [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, browser dashboard, MCP endpoint, logging |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
 | [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |
 | [Configuration](docs/configuration.md) | Config format, every field, environment variables, network tuning |
-| [Proxy modes](docs/proxy-modes.md) | MITM forward proxy, sx.org residential egress |
-| [Switchyard](docs/switchyard.md) | Token attribution, MCP server, usage push |
+| [Proxy modes](docs/proxy-modes.md) | MITM forward proxy, upstream proxy, per-account routing, sx.org residential egress |
 | [Compliance](docs/compliance.md) | Terms of service notes |
+| [Switchyard](docs/switchyard.md) | Token attribution to work items, the teamclaude-work MCP server, usage push |
 
 ## Security
 

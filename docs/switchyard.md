@@ -5,7 +5,7 @@ TeamClaude can attribute Claude API token usage to Switchyard work items and pus
 ## What it does
 
 - `teamclaude switchyard login` gets a Switchyard API token via browser OAuth and stores it in `~/.config/teamclaude.json`.
-- `teamclaude mcp install` registers the TeamClaude MCP server with Claude Code.
+- `teamclaude mcp install` registers the `teamclaude-work` stdio MCP server with Claude Code (separate from upstream's `/teamclaude/mcp` management endpoint).
 - A Claude Code agent calls `claim_work` to say *"I am working on bead X / PRD Y / PR Z."*
 - TeamClaude meters every request in that session.
 - Every `switchyard.usageIntervalSeconds` (default 300), TeamClaude pushes a batch of rows to `POST /api/v1/projects/{tenant}/{project}/token-usage`.
@@ -50,7 +50,7 @@ The login command writes the token, but you still need a `switchyard` block with
 }
 ```
 
-The interval can be set via the TUI settings screen or by hand. `0` disables pushing.
+Set the interval in the config file (`switchyard.usageIntervalSeconds`) or with `TEAMCLAUDE_SWITCHYARD_USAGE_INTERVAL_SECONDS`; a reload picks up a change. `0` disables pushing.
 
 ### 3. Register the MCP server
 
@@ -58,7 +58,7 @@ The interval can be set via the TUI settings screen or by hand. `0` disables pus
 teamclaude mcp install
 ```
 
-This adds a `teamclaude` MCP server entry to Claude Code's settings. The server talks to the running TeamClaude proxy over `http://127.0.0.1:3456` (override with `TEAMCLAUDE_MCP_URL`).
+This adds a `teamclaude-work` MCP server entry (and replaces one an earlier version registered as `teamclaude`) to Claude Code's settings. The server talks to the running TeamClaude proxy over `http://127.0.0.1:3456` (override with `TEAMCLAUDE_MCP_URL`).
 
 ## Agent usage
 

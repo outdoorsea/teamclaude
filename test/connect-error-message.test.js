@@ -7,6 +7,19 @@ import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, describeConnectError } from '../src/server.js';
 import { createConnectHandler } from '../src/mitm.js';
+import { allowLoopbackForward } from '../src/forward-target.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// A test that expects a CONNECTION-LEVEL failure must not be able to reach a
+// proxy. With HTTPS_PROXY or ALL_PROXY set in the developer's shell — common,
+// and the default on plenty of corporate machines — the request is tunneled
+// instead of refused, the proxy answers, and the test asserts against a
+// completely different error shape while still passing (#207).
+//
+// `upstreamProxy: false` is the explicit opt-out, and the empty env argument
+// stops resolveUpstreamProxy falling back to process.env.
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 // A failed connect has its reason in one of two places, and the interesting one
 // is not where you would look.
@@ -70,6 +83,15 @@ test('a connect failure that is not aggregated is described by its message', asy
   assert.equal(describeConnectError(err), err.message);
 });
 
+test('a wrapper around a single-address cause is described by the cause', () => {
+  // Global fetch wraps a plain (non-aggregated) connect error in
+  // TypeError('fetch failed'); the reason lives on `cause`.
+  const cause = new Error('connect ECONNREFUSED 127.0.0.1:1');
+  cause.code = 'ECONNREFUSED';
+  const err = new TypeError('fetch failed', { cause });
+  assert.equal(describeConnectError(err), 'connect ECONNREFUSED 127.0.0.1:1');
+});
+
 test('describeConnectError leaves nothing to print only when there is nothing', () => {
   assert.equal(describeConnectError(undefined), undefined);
   assert.equal(describeConnectError(new Error('boom')), 'boom');
@@ -116,6 +138,7 @@ test('a forward-proxy target whose every address refuses is logged with its reas
   const realErr = console.error;
   console.error = (...a) => logged.push(a.map(String).join(' '));
   const proxy = createProxyServer(am, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy); // localhost:1 is a loopback target, refused by default
   const port = await listen(proxy);
   try {
     await new Promise((resolve) => {
@@ -149,6 +172,7 @@ test('a tunnel whose every address refuses is logged with its reasons', { skip: 
   const logged = [];
   const am = new AccountManager([{ name: 'alice', type: 'apikey', apiKey: 'k1' }], 0.98);
   const server = http.createServer();
+  allowLoopbackForward(server); // localhost:1 is a loopback target, refused by default
   server.on('connect', createConnectHandler({
     config: { proxy: {}, upstream: 'https://api.anthropic.com' },
     accountManager: am,
@@ -207,7 +231,15 @@ function describeThroughGlobalFetch() {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH: '1' },
+      // The child inherits this shell, so the proxy variables are dropped for
+      // the same reason as the in-process guard above — otherwise it dials the
+      // developer's proxy instead of the closed port this test is about.
+      env: {
+        ...process.env,
+        TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH: '1',
+        HTTPS_PROXY: '', https_proxy: '', ALL_PROXY: '', all_proxy: '',
+        HTTP_PROXY: '', http_proxy: '', NO_PROXY: '*', no_proxy: '*',
+      },
     });
     const out = [];
     child.stdout.on('data', d => out.push(String(d)));

@@ -18,16 +18,53 @@ import tls from 'node:tls';
 const CONNECT_TIMEOUT_MS = 30000; // residential exits can be slow to establish
 
 // Resolved per call (not at import) so tests can point it at a local mock.
-const sxBase = () => process.env.SX_API_BASE || 'https://api.sx.org';
+//
+// The API key travels as a query parameter (the provider's design), so the base
+// URL decides whether it crosses the network in the clear. An override must be
+// https:, or plain http: to this machine only (a test mock): anything else is
+// reported once and the default is used, rather than sending the key to whatever
+// an inherited environment variable happens to name.
+const DEFAULT_SX_BASE = 'https://api.sx.org';
+let warnedBase = null;
+export function sxBase(env = process.env, warn = (m) => console.error(m)) {
+  const raw = env.SX_API_BASE;
+  if (!raw) return DEFAULT_SX_BASE;
+  let u = null;
+  try { u = new URL(raw); } catch { /* reported below */ }
+  const loopback = u && /^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])$/.test(u.hostname);
+  if (u && (u.protocol === 'https:' || (u.protocol === 'http:' && loopback))) return raw.replace(/\/$/, '');
+  if (warnedBase !== raw) {
+    warnedBase = raw;
+    warn(`[TeamClaude] ignoring SX_API_BASE=${JSON.stringify(raw)}: the sx.org API key rides in the URL, so the base must be https:// (plain http:// is allowed for loopback only); using ${DEFAULT_SX_BASE}`);
+  }
+  return DEFAULT_SX_BASE;
+}
 
 // ── sx.org REST (apiKey is a query param; these hit api.sx.org directly, never
 // the proxy, and are unrelated to Anthropic traffic) ──
+// fetch gives a connect timeout and no response timeout, so an api.sx.org that
+// accepts the connection and then says nothing hung the promise for good — and
+// `reloadAccounts` awaits this path when the sx key or mode changed on disk, so
+// `POST /teamclaude/reload` and the TUI's R key never came back (#421).
+const SX_TIMEOUT_MS = 15_000;
+// A provisioning reply is a few hundred bytes; nothing here needs more.
+const SX_MAX_REPLY_BYTES = 1 << 20;
+
+/** @param {Response} res */
+async function sxJson(res) {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > SX_MAX_REPLY_BYTES) throw new Error('sx.org reply too large');
+  const text = await res.text();
+  if (text.length > SX_MAX_REPLY_BYTES) throw new Error('sx.org reply too large');
+  return JSON.parse(text);
+}
+
 async function sxGet(path, apiKey, params = {}) {
   const url = new URL(sxBase() + path);
   url.searchParams.set('apiKey', apiKey);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-  const res = await fetch(url, { headers: { accept: 'application/json' } });
-  return res.json();
+  const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(SX_TIMEOUT_MS) });
+  return sxJson(res);
 }
 
 async function sxPost(path, apiKey, body) {
@@ -37,8 +74,9 @@ async function sxPost(path, apiKey, body) {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SX_TIMEOUT_MS),
   });
-  return res.json();
+  return sxJson(res);
 }
 
 export const SX_MODES = ['off', '429', 'always'];
@@ -144,6 +182,7 @@ export async function tunnelTls({ proxy, targetHost, targetPort = 443, tlsOption
  * reverse proxy, the MITM handler, and the TUI so a key change applies live.
  */
 export class SxManager {
+  /** @param {{ log?: (line: string) => void }} [opts] */
   constructor({ log = () => {} } = {}) {
     this.log = log;
     this.apiKey = null;

@@ -22,6 +22,7 @@ const DEFAULT_BASE_URL = 'https://switchyard.work';
  * @param {typeof fetch} [options.fetchFn] - test seam
  * @param {function} [options.openBrowser] - test seam
  * @param {function} [options.log] - stderr-ish logger
+ * @param {number} [options.loopbackTimeoutMs] - how long the loopback fallback waits
  * @returns {Promise<{ baseUrl: string, token: string, workspaces: { slug: string, name?: string }[] }>}
  */
 export async function authorizeSwitchyard(baseUrl = DEFAULT_BASE_URL, options = {}) {
@@ -50,7 +51,7 @@ async function deviceCodeFlow(baseUrl, { fetchFn, log, opener }) {
   const body = await res.text();
 
   if (res.status === 404 || res.status === 405) {
-    const err = new Error('server does not support device authorization');
+    const err = /** @type {Error & { code?: string }} */ (new Error('server does not support device authorization'));
     err.code = 'DEVICE_FLOW_UNSUPPORTED';
     throw err;
   }
@@ -128,14 +129,18 @@ async function deviceCodeFlow(baseUrl, { fetchFn, log, opener }) {
   throw new Error('timed out waiting for browser authorization');
 }
 
+/**
+ * @param {string} baseUrl
+ * @param {{ fetchFn?: typeof fetch, log: Function, opener: Function, timeoutMs?: number }} opts
+ */
 async function loopbackFlow(baseUrl, { log, opener, timeoutMs = 10 * 60 * 1000 }) {
   const server = createServer();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
+    server.listen(0, '127.0.0.1', () => resolve(undefined));
   });
 
-  const { port } = server.address();
+  const { port } = /** @type {import('node:net').AddressInfo} */ (server.address());
   const state = randomBytes(32).toString('base64url');
   const callbackURL = `http://127.0.0.1:${port}/cb`;
   const authURL = `${baseUrl}/dashboard/cli-auth?cb=${encodeURIComponent(callbackURL)}&state=${encodeURIComponent(state)}`;

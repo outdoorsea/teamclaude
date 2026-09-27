@@ -16,7 +16,16 @@ function makeTUI({ accounts = [{ name: 'a', index: 0, type: 'oauth', credential:
     addAccount(entry) { calls.added.push(entry); this.accounts.push({ ...entry, index: this.accounts.length }); },
     removeAccount(idx) { calls.removed.push(this.accounts[idx]?.name); this.accounts.splice(idx, 1); },
   };
-  const config = { proxy: { port: 1 }, accounts: accounts.map(a => ({ name: a.name, type: a.type })), routes: [] };
+  // An account carries the id of the config entry it was built from, which is
+  // what pairs the two lists (see account-id.js). The harness stands in for the
+  // startup path that assigns them, so it has to assign them too — the ids are
+  // fixed rather than minted only because a test reads better that way.
+  accounts.forEach((a, i) => { a.id = a.id || `entry-${i}`; });
+  const config = {
+    proxy: { port: 1 },
+    accounts: accounts.map(a => ({ id: a.id, name: a.name, type: a.type })),
+    routes: [],
+  };
   const tui = new TUI({
     accountManager: am, config, sx: null,
     saveConfig: async () => {},
@@ -187,7 +196,7 @@ test('select mode entered from the dashboard still returns to normal', () => {
 test('importing a second org adds an account instead of overwriting the first', async () => {
   const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
   const { tui, am, config, calls } = makeTUI({ accounts });
-  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
+  config.accounts = [{ id: accounts[0].id, name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' }];
   tui._readCredentials = async () => ({ accessToken: 'new', refreshToken: 'r', expiresAt: Date.now() + 3600_000 });
   tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
 
@@ -203,7 +212,7 @@ test('importing a second org adds an account instead of overwriting the first', 
 test('re-importing the same account+org still updates in place', async () => {
   const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
   const { tui, am, config, calls } = makeTUI({ accounts });
-  config.accounts = [{ name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  config.accounts = [{ id: accounts[0].id, name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
   tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
   tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
 
@@ -214,43 +223,96 @@ test('re-importing the same account+org still updates in place', async () => {
   assert.equal(am.accounts[0].credential, 'fresh');
 });
 
-// The TUI carried its own copy of the import rules, so fixes to `teamclaude
-// import` never reached [g] → Add account. Both paths now share one planner.
-
-test('refuses a token the upstream rejected instead of storing a dead account', async () => {
-  const { tui, config, calls } = makeTUI();
-  config.accounts = [];
-  tui._readCredentials = async () => ({ accessToken: 'dead', refreshToken: 'r', expiresAt: Date.now() - 1000 });
-  tui._readProfile = async () => ({ error: 'HTTP 401: OAuth access token has expired', status: 401 });
+test('re-importing a routed account keeps its proxy and says the profile lookup went around it', async () => {
+  const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
+  const { tui, config } = makeTUI({ accounts });
+  config.accounts = [{ id: accounts[0].id, name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme', routing: 'socks5h://alice:s3cret@proxy.example.com:1080' }];
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
 
   await tui._doImport();
 
-  assert.equal(config.accounts.length, 0);
-  assert.equal(calls.added.length, 0);
+  assert.equal(config.accounts[0].routing, 'socks5h://alice:s3cret@proxy.example.com:1080', 'the import carries no routing key, so the entry keeps its own');
+  const lines = tui.log.map(l => l.msg);
+  assert.ok(lines.some(l => /"a@x\.com" has its own proxy, and this import's profile lookup did not go through it/.test(l)), lines.join('\n'));
+  assert.equal(lines.some(l => l.includes('s3cret')), false);
 });
 
-test('a refused import leaves the TUI running', async () => {
-  // The CLI exits here; this process is the proxy, so it must not.
-  const { tui } = makeTUI();
-  tui._readCredentials = async () => ({ accessToken: 'dead', refreshToken: 'r', expiresAt: 0 });
-  tui._readProfile = async () => ({ error: 'HTTP 403: revoked', status: 403 });
-
-  await tui._doImport();
-
-  assert.ok(tui.log.some(l => /refused/i.test(l.msg)), 'expected a refusal in the log pane');
-});
-
-test('an unreachable profile endpoint still imports', async () => {
-  // Only a rejection is proof; a network failure must not block a good token.
-  const { tui, config, calls } = makeTUI();
-  config.accounts = [];
-  tui._readCredentials = async () => ({ accessToken: 'good', refreshToken: 'r', expiresAt: Date.now() + 3600_000 });
-  tui._readProfile = async () => ({ error: 'fetch failed' });
+test('import with an unidentified profile adds no placeholder account', async () => {
+  const { tui, am, config, calls } = makeTUI();
+  tui._readCredentials = async () => ({
+    accessToken: 'invalid',
+    refreshToken: 'invalid-refresh',
+    expiresAt: Date.now() - 1,
+  });
+  tui._readProfile = async () => ({ error: 'expired token' });
 
   await tui._doImport();
 
   assert.equal(config.accounts.length, 1);
-  assert.equal(calls.added.length, 1);
+  assert.equal(am.accounts.length, 1);
+  assert.equal(calls.added.length, 0);
+  assert.ok(tui.log.some(l => /Import refused: could not identify OAuth account/.test(l.msg)));
+});
+
+test('email-only profile re-import preserves known running identity', async () => {
+  const accounts = [{
+    name: 'a@x.com',
+    index: 0,
+    type: 'oauth',
+    credential: 'old',
+    accountUuid: 'u1',
+    orgUuid: 'o1',
+    orgName: 'Example',
+  }];
+  const { tui, am, config } = makeTUI({ accounts });
+  config.accounts = [{
+    id: accounts[0].id,
+    name: 'a@x.com',
+    type: 'oauth',
+    accountUuid: 'u1',
+    orgUuid: 'o1',
+    orgName: 'Example',
+  }];
+  tui._readCredentials = async () => ({
+    accessToken: 'fresh',
+    refreshToken: 'fresh-refresh',
+    expiresAt: Date.now() + 3600_000,
+  });
+  tui._readProfile = async () => ({ email: 'a@x.com' });
+
+  await tui._doImport();
+
+  assert.equal(am.accounts[0].accountUuid, 'u1');
+  assert.equal(am.accounts[0].orgUuid, 'o1');
+  assert.equal(am.accounts[0].orgName, 'Example');
+  assert.equal(am.accounts[0].credential, 'fresh');
+});
+
+test('import stores quota tier metadata returned by the OAuth profile', async () => {
+  const { tui, config } = makeTUI({ accounts: [] });
+  const expiresAt = 1_900_000_000_000;
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r', expiresAt });
+  tui._readProfile = async () => ({
+    email: 'team@x.com', accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
+    hasClaudeMax: true, hasClaudePro: false,
+  });
+
+  await tui._doImport();
+
+  // The entry id is minted per entry and is not a tier field (#199), so it is
+  // checked for shape and set aside rather than pinned to a value the test
+  // cannot know. Everything else is compared exactly.
+  const { id, ...entry } = config.accounts[0];
+  assert.match(id, /^[0-9a-f-]{36}$/, 'a new entry is given an id');
+  assert.deepEqual(entry, {
+    name: 'team@x.com', type: 'oauth', source: 'import',
+    accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
+    hasClaudeMax: true, hasClaudePro: false,
+    accessToken: 'fresh', refreshToken: 'r', expiresAt,
+  });
 });
 
 // Node's setInterval takes a 32-bit millisecond delay; an interval past
@@ -267,3 +329,20 @@ test('a probe interval over seven days is refused, not scheduled', async () => {
   assert.equal(config.quotaProbeSeconds, 604800);
 });
 
+
+// The footer echoes the prompt buffer while it is typed. For a key, that echo
+// is the key in clear on a screen that is often shared.
+test('an API key being typed is masked in the footer', () => {
+  const { tui } = makeTUI();
+  openSettingsRow(tui, 'addAccount');
+  tui._key('k');
+  type(tui, 'sk-secret');
+  const footer = tui._renderFooter().replace(/\x1b\[[0-9;]*m/g, '');
+  assert.doesNotMatch(footer, /sk-secret/);
+  assert.match(footer, /API key: \*{9}█/);
+  tui._key('esc');
+  // The next, ordinary prompt echoes again.
+  tui._promptInput('Switch threshold (%)', () => {});
+  type(tui, '95');
+  assert.match(tui._renderFooter(), /95█/);
+});
