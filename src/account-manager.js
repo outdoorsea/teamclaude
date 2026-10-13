@@ -9,9 +9,12 @@ import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
+import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
+import { forecastWindow } from './forecast.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
+import { envVar } from './brand.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
@@ -61,6 +64,8 @@ const ADAPTIVE_STATS_CACHE_MS = 1000;
 // when the token turned over, short enough that a genuinely bad new token
 // recovers on the next request rather than staying stuck.
 const FORCED_REFRESH_FLOOR_MS = 10_000;
+// How many distinct models an account's recentModels table remembers.
+const MAX_RECENT_MODELS = 8;
 // An organization-level OAuth policy denial is not repaired by an immediate
 // retry. Keep the account out of automatic rotation long enough for other
 // members to serve, then re-admit it so an administrator's policy change is
@@ -72,6 +77,16 @@ const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
 // proxies do come back, and the first request after the cooldown is the probe:
 // it either serves or re-arms this.
 const ROUTING_FAILURE_COOLDOWN_SECONDS = 30;
+// How long an API-key account sits out after upstream answers 401, indexed by
+// how many 401s it has answered in a row. A 401 on an API key is weaker
+// evidence than it looks: a gateway (LiteLLM and the like) answers one while
+// its OWN upstream is unreachable, with a key that is perfectly good (#473).
+// So the first hold is short, and each further rejection with no success in
+// between lengthens it. The last entry is the ceiling and is never left for a
+// permanent `error`: a key that really is revoked then costs one failed-over
+// request an hour, which is cheap, while a fallback account silently dead for
+// good is not.
+export const CREDENTIAL_REJECTED_COOLDOWNS_SECONDS = [60, 5 * 60, 15 * 60, 60 * 60];
 
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
 // header NAMES, so the table needs a ceiling an upstream cannot talk past.
@@ -106,16 +121,22 @@ export const DEFAULT_SWITCH_THRESHOLD = 0.98;
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
+  'unified5hSeenAt', 'unified7dSeenAt',
   'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
   'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
   'scopedWeekly',
-  // Codex free rate-limit reset credits, `{ available, applicable, seenAt }`.
+  // Codex free rate-limit reset credits and Claude banked usage-limit resets,
+  // `{ available, applicable, seenAt, expiresAt? }`.
   // Worth persisting although it is not a quota: the usage probe is off by
   // default, so without this a restart forgets that an account holds a credit
-  // until something next reads /wham/usage — and the row that says so is the
+  // until something next reads the usage endpoint — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  // Until when a Claude reset attempt on this account holds the whole Claude
+  // pool (claude-resets.js): a bare timestamp, so a restart minutes after a
+  // claim that may have landed does not spend a sibling's on top of it.
+  'claudeResetHoldUntil',
   // Whether the last Codex reading stated a 5-hour window at all (see
   // _updateCodexQuota). A fact about the subscription's shape rather than a
   // counter, so it holds across a restart: without it a restored Codex row
@@ -146,7 +167,7 @@ const FAMILY_WEEKLY_BUCKETS = [
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number}} [resetCredits]  free rate-limit reset credits held, and when that was last seen
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
@@ -168,6 +189,12 @@ function emptyQuota() {
     unified7dReset: null,       // ms timestamp
     unified7dSonnetReset: null, // ms timestamp
     unified7dFableReset: null,  // ms timestamp
+    // When upstream last stated each shared window (ms timestamp), moved only
+    // with that window's own value. Nothing here gates on them: they are for
+    // status readers, which otherwise cannot tell a reading taken a minute ago
+    // from one restored off disk after a week idle. Null means unknown age.
+    unified5hSeenAt: /** @type {number|null} */ (null),
+    unified7dSeenAt: /** @type {number|null} */ (null),
     // When each family bucket was last confirmed by upstream (ms timestamp).
     // Only these two buckets need it: they are the ones a spent reading can seal
     // itself into, since selection stops sending the family that would refresh them.
@@ -175,7 +202,9 @@ function emptyQuota() {
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     // Normalized reading from a third-party backend (see backend-quota.js).
-    // { label, text, utilization, at } — nothing here knows which provider.
+    // { label, text, utilization, at, windows? } — nothing here knows which
+    // provider. windows feeds the fiveHour/weeklyShared/monthly buckets of
+    // /teamclaude/quota (quota-summary.js).
     backend: null,
     unifiedStatusSeenAt: null,  // ms timestamp of the response that reported it
     // Every model-scoped weekly bucket the usage endpoint named, keyed by its
@@ -297,6 +326,7 @@ function makeAccount(acct, index, listener = null) {
     // that id. The Anthropic counterpart is `accountUuid`, which is patched
     // into the request body instead.
     accountId: acct.accountId || null,
+    userId: acct.userId || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -362,6 +392,9 @@ function makeAccount(acct, index, listener = null) {
     refreshToken: acct.refreshToken || null,
     expiresAt: acct.expiresAt || null,
     status: 'active',
+    // Why the account last went to 'error' (see _needsLogin); read only while
+    // status is 'error', so a recovery path need not clear it.
+    errorReason: /** @type {{ code: string, detail: string, since: number, remedy: string }|null} */ (null),
     // No quota is known at startup, so start probing: the first response for
     // an account reveals its weekly limit and triggers re-evaluation.
     probing: true,
@@ -397,9 +430,22 @@ function makeAccount(acct, index, listener = null) {
     // The account's own routing proxy could not be reached (see
     // markRoutingFailed). Ephemeral for the same reason: a live observation.
     routingFailedUntil: /** @type {number|null} */ (null),
+    // Upstream answered 401 to this account's API key (see
+    // markCredentialRejected). Ephemeral like the two above. The count is of
+    // consecutive rejections and sets the length of the next hold; a response
+    // that is not an error resets it.
+    credentialRejectedUntil: /** @type {number|null} */ (null),
+    credentialRejections: 0,
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
+    // Outside-spend attribution (see beginActivity/endActivity): how many
+    // requests have been dispatched to this account, and how many are still
+    // open. Unlike inFlight, a request stays open until its response has fully
+    // ended — a stream spends quota long after its headers arrived.
+    activitySeq: 0,
+    activityOpen: 0,
+    activityEndedAt: 0,
     rampStartedAt: null,
     // Rate-limit pause (see pauseAccount): a short window during which new
     // requests wait in admit() rather than flooding — set from a 429's
@@ -413,6 +459,12 @@ function makeAccount(acct, index, listener = null) {
     // The refresh token upstream last rejected as invalid, if it is still the
     // one we hold — see the dead-token guard in ensureTokenFresh.
     _deadRefreshToken: null,
+    // Whether the token it holds was minted by the token endpoint for this
+    // process — a renewal here, not one taken from the store. Only such a token
+    // is fresh enough to store on callback.net (credential-sync.js). Never
+    // persisted, so false at every launch, and false again whenever tokens
+    // arrive from elsewhere (updateAccountTokens).
+    _minted: false,
   };
 }
 
@@ -432,12 +484,41 @@ function sampleModelFor(route) {
   return route.match[0].replace(/\*/g, '') || 'model';
 }
 
+/**
+ * Normalize the `advisorEligibility` setting to a mode.
+ *
+ *   'strict' / absent → the account must be eligible for the advisor's model as
+ *                       well as the request's (#98). The default.
+ *   'prefer'          → the advisor's model stops being a filter when honouring
+ *                       it would leave part of the fleet unused (see
+ *                       _advisorForSelection).
+ * Anything else is 'strict'. Unlike distributeSessions there is no generous
+ * reading of a typo here: 'prefer' lets an account that is not routed for the
+ * advisor's family serve it, so it is only ever entered by name. Said once,
+ * naming the value, so the operator is not left believing it took.
+ */
+const warnedAdvisorValues = new Set();
+
+/** @param {unknown} setting  @returns {'strict'|'prefer'} */
+export function advisorEligibilityMode(setting) {
+  if (setting == null) return 'strict';
+  const value = typeof setting === 'string' ? setting.trim().toLowerCase() : null;
+  if (value === 'strict' || value === 'prefer') return value;
+  const shown = safeLine(JSON.stringify(setting) ?? String(setting), 64);
+  if (!warnedAdvisorValues.has(shown)) {
+    warnedAdvisorValues.add(shown);
+    console.warn(`[TeamClaude] advisorEligibility: unrecognised value ${shown}, using "strict" (valid: "strict", "prefer")`);
+  }
+  return 'strict';
+}
+
 export class AccountManager {
   /**
    * @param {Array<Object>} accounts  config entries, credentials resolved
    * @param {number|Object<string, number>} [switchThreshold]  one number, or per bucket with a `default`
    * @param {Object} [opts]
    * @param {Function} [opts.refreshFn]
+   * @param {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} [opts.refreshCoordinator]  wraps every token refresh (credential-sync.js takes it through a shared lock); the default just refreshes. Resolving null keeps the current token: nothing is written and nothing is announced
    * @param {Function} [opts.codexRefreshFn]
    * @param {number} [opts.throttleProbeFloorMs]
    * @param {number} [opts.familyStaleMs]
@@ -449,15 +530,17 @@ export class AccountManager {
    * @param {Object} [opts.adaptive]
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
+   * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
     this._codexRefreshFn = codexRefreshFn;
+    this._refreshCoordinator = refreshCoordinator;
     // Kept for accounts added at runtime, which go through the same guard.
     this.listener = listener;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index, listener));
@@ -479,6 +562,9 @@ export class AccountManager {
     // estimate. Learners are constructed unconditionally so enabling adaptive
     // mode at runtime can use observations already collected in this process.
     this.burnRateLearner = new BurnRateLearner(adaptive);
+    this.outsideSpend = new OutsideSpendTracker();
+    // Hands out stamps no other reading can equal (see _activityStamp).
+    this._busyStamp = 0;
     this.concurrencyLearner = new ConcurrencyLearner(adaptive);
     // The last adaptiveStats() a status read computed, and when. Time is the
     // only thing that invalidates it (see _adaptiveStatsCached).
@@ -512,6 +598,16 @@ export class AccountManager {
     // as a spent family bucket does not (#276).
     this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
+    // 'strict' | 'prefer': whether an advisor request's second model filters
+    // the fleet or merely describes it (see _advisorForSelection).
+    this.setAdvisorEligibility(advisorEligibility);
+    // The last advisor request whose advisor model left part of the fleet out,
+    // for the status readout: { model, eligible, of, at }. Null once an advisor
+    // request finds the two sets equal again. The log line is throttled and
+    // scrolls away; this is what an operator reading status later still sees.
+    /** @type {{ model: string, eligible: number, of: number, at: number }|null} */
+    this._advisorNarrowing = null;
+    this._advisorNarrowLogAt = 0;
     this.setRoutes(routes);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
@@ -569,20 +665,20 @@ export class AccountManager {
     // becomes probe-eligible (see _isProbeable). Long enough to honor a genuine
     // retry-after, short enough that a stale hold cannot pin the fleet.
     this.throttleProbeFloorMs = throttleProbeFloorMs
-      ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
+      ?? (Number(envVar('THROTTLE_PROBE_FLOOR_MS')) || 60_000);
     // How long a SPENT family (Fable/Sonnet) weekly reading is trusted before it
     // is cleared for revalidation (see _clearExpiredQuotas). Long enough that a
     // genuinely spent bucket costs at most one rejected request per account per
     // window, short enough that a stale reading cannot lock a family out for the
     // rest of the weekly window.
     this.familyStaleMs = familyStaleMs
-      ?? (Number(process.env.TEAMCLAUDE_FAMILY_STALE_MS) || 30 * 60_000);
+      ?? (Number(envVar('FAMILY_STALE_MS')) || 30 * 60_000);
     // Same discipline for the upstream `unified-status`: it is a snapshot of one
     // response, not a subscription, so nothing revalidates it while the account
     // sits idle and acting on an old `rejected` would bar an account whose quota
     // reset hours ago. Past this it is dropped and the local buckets decide.
     this.statusStaleMs = statusStaleMs
-      ?? (Number(process.env.TEAMCLAUDE_STATUS_STALE_MS) || 30 * 60_000);
+      ?? (Number(envVar('STATUS_STALE_MS')) || 30 * 60_000);
   }
 
   /**
@@ -936,6 +1032,31 @@ export class AccountManager {
     if (account?.routingFailedUntil) account.routingFailedUntil = null;
   }
 
+  /** True while an API-key account sits out a 401 (see markCredentialRejected).
+   * Expiry is consumed lazily, as the other cooldowns' is. The count of
+   * rejections is NOT cleared here: only a served request proves the key, and
+   * the request that follows the hold is the one that finds out.
+   * @param {Record<string, any>|undefined} account
+   * @param {number} [now] */
+  _credentialHeld(account, now = Date.now()) {
+    if (!account?.credentialRejectedUntil) return false;
+    if (now < account.credentialRejectedUntil) return true;
+    account.credentialRejectedUntil = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" 401 cooldown expired; the next request retries its API key`);
+    return false;
+  }
+
+  /** A response that was not an error is proof the key works: lift the hold
+   * and forget the rejections that led to it, so the next 401 starts again
+   * from the shortest cooldown.
+   * @param {number} index */
+  clearCredentialRejected(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.credentialRejectedUntil = null;
+    account.credentialRejections = 0;
+  }
+
   /** True while an account is in its routing-failure cooldown; expiry is
    * consumed lazily, as the entitlement cooldown's is.
    * @param {Record<string, any>|undefined} account
@@ -957,7 +1078,10 @@ export class AccountManager {
    * sub-inference runs on the SAME account and spends that model's family
    * bucket, so the account must be eligible for both models. When no account
    * satisfies both, selection degrades to executor-only routing so the main
-   * request keeps flowing (upstream then fails just the advisor call).
+   * request keeps flowing (upstream then fails just the advisor call). When
+   * only SOME do, the request is confined to them, which is said in the log,
+   * or under `advisorEligibility: "prefer"` it is routed on its own model
+   * instead (see _advisorForSelection).
    *
    * `sessionId` is a PIN KEY throughout this class and the session tracker: a
    * client session narrowed to the conversation within it, since one client
@@ -984,6 +1108,10 @@ export class AccountManager {
 
     let account;
     let walked;
+    // The advisor model selection was held to: the request's own, or null
+    // where 'prefer' set it aside (see _advisorForSelection).
+    /** @type {*} */
+    let routedAdvisor = null;
     // Scoped rather than threaded through _select/_selectNext/_divertedFor: the
     // whole walk is synchronous, so nothing can interleave and observe it, and
     // the alternative is a provider argument on six private methods that exist
@@ -996,7 +1124,16 @@ export class AccountManager {
     // upstream round trip, by which time another request has selected.
     this._selectionDecision = decision;
     try {
-      account = this._pickActiveAccount(this._excludeOtherProviders(exclude, provider), model, advisorModel, sessionId);
+      const excluded = this._excludeOtherProviders(exclude, provider);
+      // Settled once, here, rather than in the walks: session distribution and
+      // the untagged spread select on the advisor model as well, so a check
+      // inside _select alone would miss exactly the configurations that spread.
+      // Read where the cursor is recorded below too, so it is keyed by what
+      // was routed on. Announced by a first attempt only: a retry's exclusions
+      // shrink both sets, so its counts describe that request and not the fleet.
+      const first = !(/** @type {Set<number>|null} */ (exclude)?.size);
+      routedAdvisor = this._advisorForSelection(excluded, model, advisorModel, first);
+      account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
@@ -1011,7 +1148,7 @@ export class AccountManager {
     // rotation code, so recording there alone would leave the cursor unset and
     // the next real failover unpaced.
     if (account) {
-      this.routeCursors.set(this._cursorKey(model, advisorModel, provider), account.index);
+      this.routeCursors.set(this._cursorKey(model, routedAdvisor, provider), account.index);
       // `walked` names where this walk left the shared slot, captured in the
       // `finally` while it still held it. When it names one of this provider's
       // own accounts — including a borrow that re-seeded and then held its
@@ -1224,7 +1361,15 @@ export class AccountManager {
     // fleet-wide gate is what keeps a hop off a HEALTHY account (a per-minute
     // 429 pause leaves it available) from spending quota to skip a wait — see
     // _pickFallback.
-    const normal = this._pickBestAvailable(excluded, model, advisorModel);
+    // The same reading of the advisor model as the selection this hop detours
+    // from, or 'prefer' would spread the first attempt and pin every hop. A hop
+    // has no executor-only pass of its own to fall to, so under 'prefer' the
+    // advisor is set aside here when nothing left can serve it as well.
+    // Unannounced: a hop's exclusions shrink both sets, so its counts describe
+    // this one request and not the fleet.
+    const reach = advisorModel && this.advisorEligibility === 'prefer'
+      ? this._advisorReach(excluded, model, advisorModel) : null;
+    const normal = this._pickBestAvailable(excluded, model, reach && reach.eligible < reach.of ? null : advisorModel);
     if (normal) return normal;
     const pick = this._pickFallback(excluded, model, provider);
     if (!pick) return null;
@@ -1267,6 +1412,83 @@ export class AccountManager {
     const combined = new Set(exclude || []);
     for (const account of foreign) combined.add(account.index);
     return combined;
+  }
+
+  /**
+   * The advisor model selection should hold accounts to: `advisorModel` itself,
+   * or null where 'prefer' sets it aside.
+   *
+   * Claude Code declares the advisor tool on EVERY request, invoked or not, so
+   * the advisor's eligibility is paid by all of a client's traffic. Where only
+   * some of the accounts that can serve the request can also serve the
+   * advisor, that confines the whole fleet's traffic to them and leaves the
+   * rest idle, and nothing used to say so: the one diagnostic fired at zero
+   * eligible accounts, not at one (#479).
+   *
+   * 'strict' keeps the filter (#98: an account that cannot run the advisor
+   * fails the advisor call, and Claude Code then drops the advisor for the
+   * session) and announces the narrowing. 'prefer' routes such a request as
+   * though it declared no advisor: every account that can serve the request's
+   * own model is a candidate, under the ordinary rotation, and whichever serves
+   * it runs the advisor call too. The advisor model is kept wherever it costs
+   * nothing, which is when every candidate can serve it.
+   *
+   * No eligible account at all is neither case. It stays with the degrade in
+   * _pickActiveAccount, which has always routed it on the request model.
+   *
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {boolean} [note]  announce and record what was found
+   * @returns {string|null}
+   */
+  _advisorForSelection(exclude, model, advisorModel, note = false) {
+    if (!advisorModel) return null;
+    const { eligible, of } = this._advisorReach(exclude, model, advisorModel);
+    const narrows = eligible > 0 && eligible < of;
+    const prefer = this.advisorEligibility === 'prefer';
+    if (note) {
+      // Left as it was when nothing is eligible: that is the degrade's case,
+      // and it says nothing about whether the fleet is narrowed otherwise.
+      if (narrows) this._advisorNarrowing = { model: safeLine(advisorModel, 64), eligible, of, at: Date.now() };
+      else if (eligible > 0) this._advisorNarrowing = null;
+    }
+    // Throttled like the degrade line in _pickActiveAccount, and for the same
+    // reason: this is true of every request a Claude Code session sends.
+    if (note && narrows && Date.now() >= this._advisorNarrowLogAt) {
+      this._advisorNarrowLogAt = Date.now() + 60_000;
+      // The model name comes out of the client's request body (see safe-text.js).
+      const name = safeLine(advisorModel, 64);
+      console.log(prefer
+        ? `[TeamClaude] Advisor model "${name}" is served by ${eligible} of ${of} accounts — advisorEligibility is "prefer", routing by request model only`
+        : `[TeamClaude] Advisor model "${name}" narrows selection to ${eligible} of ${of} accounts — set advisorEligibility to "prefer" to route by request model instead`);
+    }
+    return narrows && prefer ? null : advisorModel;
+  }
+
+  /** How many accounts outside `exclude` can serve `model` right now (`of`),
+   *  and how many of those can serve `advisorModel` as well (`eligible`). Two
+   *  availability checks per account, on a path that already makes several.
+   *  @param {Set<number>|null} exclude
+   *  @param {*} model  loosely typed, like the availability checks it feeds
+   *  @param {*} advisorModel
+   *  @returns {{ eligible: number, of: number }} */
+  _advisorReach(exclude, model, advisorModel) {
+    let eligible = 0;
+    let of = 0;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (!this._isAvailable(account, model, null)) continue;
+      of++;
+      if (this._isAvailable(account, model, advisorModel)) eligible++;
+    }
+    return { eligible, of };
+  }
+
+  /** Apply the `advisorEligibility` setting; safe on every config reload.
+   *  @param {unknown} setting */
+  setAdvisorEligibility(setting) {
+    this.advisorEligibility = advisorEligibilityMode(setting);
   }
 
   _pickActiveAccount(exclude, model, advisorModel, sessionId) {
@@ -1439,14 +1661,25 @@ export class AccountManager {
    * prompt cache it built there. An untagged request picks where it goes and
    * changes nothing for anyone else.
    *
+   * The cursor turns within the top priority tier only, the filter
+   * `_pickAdaptive` keeps for the same reason: banding may span priorities (it
+   * passes everything through when expiry routing is off, and appends the lower
+   * tiers back when it is on). Without it a last-resort account took its turn
+   * like any other — a priority-200 inference gateway answered Claude Code's
+   * bootstrap and connector calls with 404 while every account above it had
+   * quota (#472). A lower tier sees untagged traffic once nothing above it is
+   * available.
+   *
    * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string|null} advisorModel
    * @returns {Record<string, any>|null}
    */
   _selectUntagged(exclude, model, advisorModel) {
-    const candidates = this._bandedCandidates(exclude, model, advisorModel);
-    if (candidates.length === 0) return null;
+    const banded = this._bandedCandidates(exclude, model, advisorModel);
+    if (banded.length === 0) return null;
+    const topPriority = Math.min(...banded.map(a => a.priority || 0));
+    const candidates = banded.filter(a => (a.priority || 0) === topPriority);
     const cursor = this._untaggedCursor;
     this._untaggedCursor = cursor + 1;
     return candidates[cursor % candidates.length];
@@ -1757,6 +1990,30 @@ export class AccountManager {
   }
 
   /**
+   * A threaded request filed under `pinKey` was answered with `messageId`
+   * (after `previousId`, for a continue), so a continue naming it can find its
+   * conversation (see SessionTracker.threadOwner).
+   *
+   * @param {string|null} pinKey
+   * @param {string} messageId
+   * @param {string|null} [previousId]
+   */
+  recordThreadMessage(pinKey, messageId, previousId = null) {
+    if (pinKey) this.sessionTracker.recordThreadMessage(pinKey, messageId, previousId);
+  }
+
+  /**
+   * The conversation of `sessionId` that produced message `messageId`, or null.
+   *
+   * @param {string|null} sessionId
+   * @param {unknown} messageId
+   * @returns {{ key: string, conversation: string|null }|null}
+   */
+  threadOwner(sessionId, messageId) {
+    return this.sessionTracker.threadOwner(sessionId, messageId);
+  }
+
+  /**
    * Record a client request's outcome WITHOUT closing an in-flight hold — for
    * the exits that answer or refuse before beginSession ever opened one.
    */
@@ -1997,6 +2254,10 @@ export class AccountManager {
     // Nor a routing cooldown: probing would spend the connect budget on a
     // proxy that was unreachable seconds ago, and the hold is short anyway.
     if (this._routingDown(account)) return false;
+    // Nor a 401 cooldown. The probe path runs when every account is
+    // unavailable, which is exactly when a held API key would otherwise be
+    // asked again on every request — the loop the hold exists to prevent.
+    if (this._credentialHeld(account)) return false;
     // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
     // 429 that armed it may itself have been transient (e.g. the retry burst
     // after a network flap), and while it lasts NOTHING revalidates it — so a
@@ -2298,7 +2559,7 @@ export class AccountManager {
    *
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
-   * 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * 'credential', 'advisor-capped', 'advisor-quota', 'advisor-route'.
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -2326,6 +2587,9 @@ export class AccountManager {
 
     // The account's own routing proxy could not be reached a moment ago.
     if (this._routingDown(account)) return 'routing';
+
+    // Upstream answered 401 to this account's API key a moment ago.
+    if (this._credentialHeld(account)) return 'credential';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -3419,6 +3683,7 @@ export class AccountManager {
       account.sessionResetPending = true;
       q.unified5h = null;
       q.unified5hReset = null;
+      q.unified5hSeenAt = null;
       // `rejected` describes the shared buckets and this is one of them: a
       // 5-hour rejection must not outlive the 5-hour window it was about.
       q.unifiedStatus = null;
@@ -3430,6 +3695,7 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
+      q.unified7dSeenAt = null;
       q.unifiedStatus = null;
       q.unifiedStatusSeenAt = null;
       changed = true;
@@ -3822,6 +4088,9 @@ export class AccountManager {
       // here would send a live request on an account that must not be used and,
       // below, silently clear its throttle/error state. (Mirrors _isAvailable.)
       if (account.disabled || account.status === 'error') continue;
+      // Nor one sitting out a 401: an old quota window that has since rolled
+      // would otherwise name it the soonest to reset and send it the request.
+      if (this._credentialHeld(account)) continue;
       // A routed/owned model must not fall back to an ineligible account —
       // neither the executor's nor an advisor's.
       if (model && !this._routeAllows(account, model)) continue;
@@ -3882,9 +4151,13 @@ export class AccountManager {
       limits[key] = safeLine(active, 64);
     }
 
-    if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
+    if (parsed.unified5h != null) {
+      account.quota.unified5h = parsed.unified5h;
+      account.quota.unified5hSeenAt = Date.now();
+    }
     if (parsed.unified7d != null) {
       account.quota.unified7d = parsed.unified7d;
+      account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
     if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
@@ -3936,6 +4209,7 @@ export class AccountManager {
     }
 
     this._observeBurnRate(account, observed);
+    this._observeOutsideSpend(account, observed);
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -3950,6 +4224,21 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
+    // Which models this account served, and when each was last seen, so the
+    // dashboard can say what an account is busy with right now. The model is
+    // client-supplied, so it is stripped like every other rendered string, and
+    // the table keeps only the most recently seen few.
+    const modelName = typeof model === 'string' ? safeLine(model, 64) : '';
+    if (modelName) {
+      // `usage` is built without the table (see makeAccount), so it is added
+      // here on first sight.
+      const usage = /** @type {Record<string, any>} */ (account.usage);
+      /** @type {Record<string, number>} */
+      const seen = { ...(usage.recentModels || {}), [modelName]: Date.now() };
+      usage.recentModels = Object.fromEntries(
+        Object.entries(seen).sort((a, b) => b[1] - a[1]).slice(0, MAX_RECENT_MODELS));
+    }
+
     // Codex reports the same information under its own header names, so it is
     // normalised into the very fields the Anthropic path fills. Everything
     // downstream — the switch threshold, reset countdowns, the TUI bars — then
@@ -3963,9 +4252,13 @@ export class AccountManager {
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
-    if (!isNaN(u5h)) account.quota.unified5h = u5h;
+    if (!isNaN(u5h)) {
+      account.quota.unified5h = u5h;
+      account.quota.unified5hSeenAt = Date.now();
+    }
     if (!isNaN(u7d)) {
       account.quota.unified7d = u7d;
+      account.quota.unified7dSeenAt = Date.now();
       observed.add('unified7d');
     }
 
@@ -4043,6 +4336,7 @@ export class AccountManager {
     if (resetsAt != null) account.quota.resetsAt = resetsAt;
 
     this._observeBurnRate(account, observed);
+    this._observeOutsideSpend(account, observed, { familyResets: false });
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -4056,6 +4350,164 @@ export class AccountManager {
           : '?';
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /**
+   * A request was dispatched to this account. Pair every call with
+   * endActivity() once the response has fully ended (or failed): outside-spend
+   * attribution reads "the proxy served nothing between two readings" from
+   * these two counters, so an open stream must keep the account busy.
+   * @param {number} index
+   */
+  beginActivity(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.activitySeq = (account.activitySeq || 0) + 1;
+    account.activityOpen = (account.activityOpen || 0) + 1;
+  }
+
+  /** The request opened by beginActivity() has ended.
+   * @param {number} index */
+  endActivity(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    if ((account.activityOpen || 0) > 0) account.activityOpen--;
+    account.activityEndedAt = Date.now();
+  }
+
+  /**
+   * The account's activity at the moment of a reading. Two readings with the
+   * same stamp bracket an interval in which nothing was dispatched and nothing
+   * was open. A request open AT a reading gets a stamp no later reading can
+   * equal, so the interval after it can never count as idle — the stream may
+   * still be spending.
+   * @param {Record<string, any>} account
+   */
+  _activityStamp(account, now = Date.now()) {
+    if ((account.activityOpen || 0) > 0) return `busy:${++this._busyStamp}`;
+    // Our own spend can reach the usage endpoint a little after the response
+    // ended. A reading taken inside that settle time may not yet carry it, and
+    // the next reading would then show it as a rise across an "idle" interval.
+    // So the account counts as busy until the settle time has passed.
+    if (now - (account.activityEndedAt || 0) < OUTSIDE_SPEND_SETTLE_MS) return `busy:${++this._busyStamp}`;
+    return `seq:${account.activitySeq || 0}`;
+  }
+
+  /** Feed fresh weekly readings to the outside-spend tracker (#475). Same
+   * buckets and same three call sites as _observeBurnRate.
+   * @param {Record<string, any>|undefined} account
+   * @param {Iterable<string>|undefined} buckets */
+  _observeOutsideSpend(account, buckets, { familyResets = true } = {}) {
+    if (!account) return;
+    const q = account.quota;
+    const now = Date.now();
+    const stamp = this._activityStamp(account, now);
+    /** @type {Set<string>} */
+    const done = new Set();
+    for (const bucket of buckets || []) {
+      let utilization;
+      let resetAt;
+      if (bucket.startsWith('scoped:')) {
+        const scoped = q.scopedWeekly?.[bucket.slice('scoped:'.length)];
+        utilization = scoped?.utilization;
+        resetAt = scoped?.resetAt ?? null;
+      } else {
+        utilization = q[bucket];
+        resetAt = q[`${bucket}Reset`] ?? null;
+      }
+      // One window, one slot: a probe reports Fable both as the dedicated
+      // field and in scopedWeekly, and counting both would show it twice.
+      const key = outsideSpendKey(bucket);
+      if (done.has(key)) continue;
+      done.add(key);
+      // The header path stores the shared weekly reset on a family bucket it
+      // has no reset for, so its family resets are not trusted to date a window.
+      if (!familyResets && key !== 'unified7d') resetAt = null;
+      if (utilization != null) {
+        this.outsideSpend.observe(account.index, key, utilization, resetAt, stamp, now);
+      }
+    }
+  }
+
+  /**
+   * `quota.outsideSpend` for status: `{ [bucket]: { share, state, since } }`.
+   * Every weekly window the account currently reports is present, so a window
+   * with no answer says `not_observed` rather than being missing — a reader
+   * must never have to guess between "absent" and "zero".
+   * @param {Record<string, any>} account
+   * @param {number} [now]
+   */
+  outsideSpendStatus(account, now = Date.now()) {
+    const tracked = this.outsideSpend.viewAll(account.index, now);
+    /** @type {Record<string, any>} */
+    const q = account.quota;
+    const known = [];
+    for (const key of ['unified7d', 'unified7dFable', 'unified7dSonnet']) if (q[key] != null) known.push(key);
+    for (const [family, bucket] of Object.entries(q.scopedWeekly || {})) {
+      if (bucket?.utilization != null) known.push(outsideSpendKey(`scoped:${family}`));
+    }
+    for (const key of known) {
+      if (!tracked[key]) tracked[key] = { share: null, state: OUTSIDE_SPEND_STATES.NOT_OBSERVED, since: null };
+    }
+    // Family names come from upstream; they are rendered into a terminal.
+    /** @type {Record<string, import('./outside-spend.js').OutsideSpendView>} */
+    const out = {};
+    for (const [key, view] of Object.entries(tracked)) out[safeLine(key, 64)] = view;
+    return out;
+  }
+
+  /**
+   * `quota.forecast` for status: `{ [bucket]: { ratePerHour, threshold,
+   * reachesThresholdAt, resetAt } }`, one entry per weekly window the account
+   * reports, keyed like `quota.outsideSpend` (#475). In every distribution
+   * mode: the learner runs in all of them, and this only reads it.
+   * @param {Record<string, any>} account
+   * @param {number} [now]
+   */
+  forecastStatus(account, now = Date.now()) {
+    /** @type {Record<string, any>} */
+    const q = account.quota || {};
+    /** @type {Record<string, import('./forecast.js').ForecastView>} */
+    const out = {};
+    /**
+     * @param {string} key  the window's status key
+     * @param {number} utilization
+     * @param {number|null} resetAt
+     * @param {string[]} learnerBuckets  where the learner may hold its rate, in order
+     */
+    const add = (key, utilization, resetAt, learnerBuckets) => {
+      const safeKey = safeLine(key, 64);
+      if (out[safeKey]) return;
+      let ratePerMs = null;
+      for (const b of learnerBuckets) {
+        ratePerMs = this.burnRateLearner.learnedRate(account.index, b);
+        if (ratePerMs != null) break;
+      }
+      // A scoped family with no dedicated field is gated against the shared
+      // weekly's threshold (_governingWeekly + _isNearQuota): `scoped:*` is
+      // not a threshold key, so asking for it would always read `default`.
+      const thresholdKey = key.startsWith('scoped:') ? 'unified7d' : key;
+      // When the reading was taken: the dedicated fields stamp it, a scoped
+      // bucket does not, and the learner saw it on the same fresh-reading path.
+      let seenAt = q[`${key}SeenAt`] ?? null;
+      for (const b of learnerBuckets) {
+        if (seenAt != null) break;
+        seenAt = this.burnRateLearner.lastReadingAt(account.index, b);
+      }
+      out[safeKey] = forecastWindow({ utilization, threshold: this.thresholdFor(thresholdKey, account), ratePerMs, resetAt, seenAt, now });
+    };
+    // A probe reports Fable and Sonnet both as the dedicated field and in
+    // scopedWeekly; the learner may have learned either, so both are asked.
+    for (const [key, family] of /** @type {const} */ ([['unified7d', null], ['unified7dFable', 'fable'], ['unified7dSonnet', 'sonnet']])) {
+      if (q[key] == null) continue;
+      add(key, q[key], q[`${key}Reset`] ?? null, family ? [key, `scoped:${family}`] : [key]);
+    }
+    for (const [family, bucket] of Object.entries(q.scopedWeekly || {})) {
+      if (bucket?.utilization == null) continue;
+      const key = outsideSpendKey(`scoped:${family}`);
+      add(key, bucket.utilization, bucket.resetAt ?? null, key === `scoped:${family}` ? [key] : [key, `scoped:${family}`]);
+    }
+    return out;
   }
 
   /**
@@ -4163,6 +4615,8 @@ export class AccountManager {
       account._deadRefreshToken = null;
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" re-enabled — clearing error state`);
     }
+    // The same explicit "try this again" for an API key sitting out a 401.
+    if (!disabled) this.clearCredentialRejected(accountIndex);
   }
 
   /**
@@ -4177,14 +4631,19 @@ export class AccountManager {
     if (!account || !usage || usage.error) return;
     const q = account.quota;
     const observed = new Set();
+    const now = Date.now();
 
     if (usage.fiveHour) {
-      if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
+      if (usage.fiveHour.utilization != null) {
+        q.unified5h = usage.fiveHour.utilization;
+        q.unified5hSeenAt = now;
+      }
       if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
     }
     if (usage.sevenDay) {
       if (usage.sevenDay.utilization != null) {
         q.unified7d = usage.sevenDay.utilization;
+        q.unified7dSeenAt = now;
         observed.add('unified7d');
       }
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
@@ -4208,7 +4667,6 @@ export class AccountManager {
     // The reported reset is taken verbatim, null included: an unstarted window
     // has no reset, and keeping a stale one (copied from the shared weekly
     // bucket by the header path) both misdates the bar and misranks the account.
-    const now = Date.now();
     for (const { key, label, usageKey } of FAMILY_WEEKLY_BUCKETS) {
       const bucket = usage[usageKey];
       const wasSpent = q[key] != null && q[key] >= this.thresholdFor(key, account);
@@ -4242,6 +4700,16 @@ export class AccountManager {
     // A probe provides fresh utilization points without spending quota itself.
     // Feed only the windows actually present in this payload.
     this._observeBurnRate(account, observed);
+    this._observeOutsideSpend(account, observed);
+
+    // Banked usage-limit resets (issue #493), stamped exactly as the Codex
+    // path stamps its reset credits: a payload with no usable reset block
+    // leaves the last reading alone, so its age is what says how much it is
+    // still worth. Typed through CodexLearnedQuota, which declares the field
+    // for both providers; the empty-quota shape does not seed it.
+    if (usage.resetCredits) {
+      /** @type {typeof q & CodexLearnedQuota} */ (q).resetCredits = { ...usage.resetCredits, seenAt: now };
+    }
 
     // Paid overage. Replaced wholesale like the buckets above, and announced
     // once on the transition into billing: an account that starts drawing real
@@ -4277,14 +4745,28 @@ export class AccountManager {
     if (usage.fiveHour) {
       q.unified5h = usage.fiveHour.utilization;
       q.unified5hReset = usage.fiveHour.resetAt ?? null;
+      q.unified5hSeenAt = Date.now();
     }
     if (usage.sevenDay) {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
+      q.unified7dSeenAt = Date.now();
+      // A read-only reading, so it can close an idle interval (#475).
+      if (q.unified7d != null) this._observeOutsideSpend(account, ['unified7d']);
     }
     // Same sticky fact the header path records; see _updateCodexQuota.
     if (usage.fiveHour) q.sessionWindowStated = true;
-    else if (usage.sevenDay) q.sessionWindowStated = false;
+    else if (usage.sevenDay) {
+      q.sessionWindowStated = false;
+      // The probe reads every limit at once, so its word that a plan has no
+      // session window is what clears a reading left from before a plan
+      // change, which would otherwise keep gating selection until its reset.
+      // The header path does not clear: one response's headers are weaker
+      // evidence of absence than the whole usage payload.
+      q.unified5h = null;
+      q.unified5hReset = null;
+      q.unified5hSeenAt = null;
+    }
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
@@ -4359,6 +4841,21 @@ export class AccountManager {
   }
 
   /**
+   * Drop a stored upstream `rejected` verdict after live proof it no longer
+   * binds — a usage-limit reset that landed. A quota re-read does not touch the
+   * verdict, so without this the account would read `upstream-rejected` until
+   * it went stale. No-op for any other verdict.
+   * @param {number} accountIndex
+   */
+  clearUpstreamRejected(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.quota.unifiedStatus !== 'rejected') return;
+    account.quota.unifiedStatus = null;
+    account.quota.unifiedStatusSeenAt = null;
+    console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" upstream rejection cleared — it no longer applies`);
+  }
+
+  /**
    * Ensure an OAuth account's token is fresh, refreshing if needed.
    * Pass force=true to refresh regardless of expiry (e.g. after a 401).
    * Concurrent calls for the same account coalesce into a single refresh.
@@ -4391,7 +4888,7 @@ export class AccountManager {
     // rotating to another account.
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
-        account.status = 'error';
+        this._needsLogin(account, 'refresh_rejected', 'its refresh token was already rejected');
         console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" still holds a rejected refresh token — run: teamclaude login`);
       }
       return;
@@ -4432,9 +4929,25 @@ export class AccountManager {
         // { accessToken, refreshToken, expiresAt } shape, which is what lets
         // everything downstream stay provider-agnostic. The account's own
         // routing applies here too: a token refresh is that account's traffic.
-        const newTokens = await (providerOf(account) === 'codex'
-          ? this._codexRefreshFn(sent, undefined, account.routing || null)
-          : this._refreshFn(sent, undefined, account.routing || null));
+        // The coordinator may answer with a token another install renewed
+        // instead of calling `refresh` at all; either way the result lands the
+        // same, below, and is persisted the same. Or with nothing: the token
+        // is still good and another install is renewing it, so this one keeps
+        // what it has and asks again on the next request.
+        // `budgetMs`: how long the grant may take, from the coordinator holding
+        // a lock that lapses (credential-sync.js); none means the default.
+        // `minted`: the token endpoint answered this call, so the tokens are
+        // known good. A coordinator answer taken from the store is not.
+        let minted = false;
+        const refresh = async (/** @type {{ budgetMs?: number }} */ opts = {}) => {
+          const tokens = await (providerOf(account) === 'codex'
+            ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
+            : this._refreshFn(sent, undefined, account.routing || null, opts));
+          minted = true;
+          return tokens;
+        };
+        const newTokens = await this._refreshCoordinator(account, refresh, { force });
+        if (newTokens == null) return;
         if (account.refreshToken !== sent) {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
@@ -4444,9 +4957,11 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account._lastRefreshAt = Date.now();
         account._deadRefreshToken = null; // this token works; clear any stale guard
+        // Set before the listener runs: it is what lets the sync store them.
+        account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
-      } catch (err) {
+      } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
@@ -4470,8 +4985,9 @@ export class AccountManager {
             console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" received new tokens while its old refresh token was being rejected — keeping the new ones`);
             return;
           }
-          account.status = 'error';
+          this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          this._onAccountError?.(account);
         }
       } finally {
         account._refreshPromise = null;
@@ -4488,11 +5004,42 @@ export class AccountManager {
     this._onTokenRefresh = callback;
   }
 
+  /** Replace the refresh coordinator (see the constructor option). */
+  setRefreshCoordinator(/** @type {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} */ fn) {
+    this._refreshCoordinator = fn;
+  }
+
+  /** Set a callback told of every OAuth account that goes into error (needs a re-login). */
+  onAccountError(/** @type {(account: Record<string, any>) => void} */ callback) {
+    this._onAccountError = callback;
+  }
+
+  /** Set a callback told of every account that leaves the fleet (removeAccount). */
+  onAccountRemoved(/** @type {(account: Record<string, any>) => void} */ callback) {
+    this._onAccountRemoved = callback;
+  }
+
   /**
    * Take an account out of rotation because upstream rejected its credential
-   * and nothing in this process can repair it. `error` is the state selection
+   * and nothing in this process can repair it.
+   *
+   * For an OAuth account that is for good: `error` is the state selection
    * already skips and status already explains ("needs re-login"); a reload that
    * brings a new credential, or re-enabling the account, clears it.
+   *
+   * For an API key it is a cooldown. `error` had no way back for one — the
+   * revalidation probe skips `error` and nothing else re-checks a key — so a
+   * single 401 from a gateway whose own upstream was down benched a working
+   * account until someone toggled it by hand, 22 hours in the report (#473).
+   * The account is held instead, for longer each time it is rejected again
+   * with no success in between (CREDENTIAL_REJECTED_COOLDOWNS_SECONDS), and the
+   * first request after the hold is the retry. While held it is unavailable to
+   * selection and to the probe alike, so the 401 loop `error` was introduced to
+   * stop (#412) stays stopped: a revoked key is asked once per cooldown.
+   *
+   * Its own field rather than the 429 hold (`throttled`/rateLimitedUntil):
+   * that one is lifted by any non-429 response and opened to the probe after a
+   * minute, and a 401 is a non-429 response.
    *
    * @param {number} accountIndex
    * @param {string} why  one clause for the log line
@@ -4500,9 +5047,42 @@ export class AccountManager {
   markCredentialRejected(accountIndex, why) {
     const account = this.accounts[accountIndex];
     if (!account || account.status === 'error') return;
+    if (account.type !== 'oauth') {
+      // Requests already in flight when the first 401 landed come back with
+      // their own. They are the same news, not further rejections, and counting
+      // them would run one bad minute straight up to the longest cooldown.
+      if (account.credentialRejectedUntil && Date.now() < account.credentialRejectedUntil) return;
+      const steps = CREDENTIAL_REJECTED_COOLDOWNS_SECONDS;
+      const seconds = steps[Math.min(account.credentialRejections || 0, steps.length - 1)];
+      account.credentialRejections = (account.credentialRejections || 0) + 1;
+      account.credentialRejectedUntil = Date.now() + seconds * 1000;
+      const nth = account.credentialRejections > 1 ? `, ${account.credentialRejections} in a row` : '';
+      console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" held out of rotation for ${seconds}s: ${why}${nth} — it will be retried after that; if it keeps failing, check the key in the config`);
+      return;
+    }
+    const { remedy } = this._needsLogin(account, 'credential_rejected', why);
+    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — run: ${remedy}`);
+    this._onAccountError?.(account);
+  }
+
+  /**
+   * Put an OAuth account in 'error' and keep why beside it. Until now the
+   * reason went to the server log only, so a status reader (the dashboard,
+   * `status --json`, a remote client) saw a bare `error` and could not tell a
+   * dead refresh token from a 401 on a refresh-less token, nor say when.
+   * @param {Record<string, any>} account
+   * @param {'refresh_rejected'|'credential_rejected'} code
+   * @param {string} detail  one clause, no credential in it
+   */
+  _needsLogin(account, code, detail) {
     account.status = 'error';
-    const remedy = account.type === 'oauth' ? 'run: teamclaude login' : 'check the key in the config';
-    console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" taken out of rotation: ${why} — ${remedy}`);
+    account.errorReason = {
+      code,
+      detail,
+      since: Date.now(),
+      remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+    };
+    return account.errorReason;
   }
 
   /**
@@ -4517,6 +5097,8 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
+    // Tokens from elsewhere (the store, a reload from disk) were not minted here.
+    account._minted = false;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${safeLine(account.name, 64)}"`);
     this._onTokenRefresh?.(accountIndex, {
@@ -4541,7 +5123,8 @@ export class AccountManager {
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
     const before = this.accounts[this.currentIndex] ?? null;
-    this.accounts.splice(index, 1);
+    const [removed] = this.accounts.splice(index, 1);
+    this._onAccountRemoved?.(removed);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
       this.currentIndex = Math.max(0, this.accounts.length - 1);
@@ -4565,6 +5148,7 @@ export class AccountManager {
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
     this.sessionTracker.remapAccounts(remap);
     this.burnRateLearner.remapAccounts(remap);
+    this.outsideSpend.remapAccounts(remap);
     this.concurrencyLearner.remapAccounts(remap);
     // The observation names its account by index, so it follows the shift or
     // goes away with the account it described. Left behind, it would be read
@@ -4621,7 +5205,8 @@ export class AccountManager {
       // `accountUuid`: a row saved without them reads as Anthropic and stops
       // matching the account it was written for. Rows from an older version
       // therefore stop restoring Codex quota, which is re-learned from traffic.
-      return { accountUuid: a.accountUuid, accountId: a.accountId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
+      const outsideSpend = this.outsideSpend.export(a.index);
+      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend };
     });
   }
 
@@ -4642,6 +5227,7 @@ export class AccountManager {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
       this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
+      this.outsideSpend.restore(account.index, match.outsideSpend);
       this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
@@ -4698,6 +5284,11 @@ export class AccountManager {
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
+      // The mode, and the last advisor request it mattered to: how many of the
+      // accounts that could serve the request could also serve its advisor.
+      // Null when the last advisor request found no difference between them.
+      advisorEligibility: this.advisorEligibility,
+      advisorNarrowing: this._advisorNarrowing ? { ...this._advisorNarrowing } : null,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
       // Empty outside adaptive mode, so the renderer needs no mode check of its
@@ -4731,6 +5322,8 @@ export class AccountManager {
         // `status --json`, and a credential has no business in either.
         routing: describeRouting(a.routing),
         status: a.status,
+        // What put it in 'error' and what brings it back; null in every other state.
+        errorReason: a.status === 'error' && a.errorReason ? { ...a.errorReason } : null,
         // Why the account is out of rotation right now (null = it can serve).
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).
@@ -4746,7 +5339,7 @@ export class AccountManager {
         // Omitted rather than sent empty when the account carries none, so the
         // renderer's "is there a breakdown" test stays a plain truthiness check.
         sessionsByBucket: sessions.perAccountBucket?.[a.index] || null,
-        quota: { ...a.quota },
+        quota: { ...a.quota, outsideSpend: this.outsideSpendStatus(a), forecast: this.forecastStatus(a) },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live
         // reference into the account, leaving the payload half snapshot and half
@@ -4772,6 +5365,9 @@ export class AccountManager {
           : null,
         routingFailedUntil: a.routingFailedUntil && a.routingFailedUntil > Date.now()
           ? new Date(a.routingFailedUntil).toISOString()
+          : null,
+        credentialRejectedUntil: a.credentialRejectedUntil && a.credentialRejectedUntil > Date.now()
+          ? new Date(a.credentialRejectedUntil).toISOString()
           : null,
       })),
     };

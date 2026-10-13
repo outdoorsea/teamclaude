@@ -117,10 +117,10 @@ curl -X POST http://localhost:3456/teamclaude/priority \
 | --- | --- |
 | `s` | Switch active account (`←`/`→` picks the default account or a specific [route](routing.md#model-routes)) |
 | `d` | Enable/disable an account |
-| `l` | Sign an account in again via the browser (opens on the first account in `error`; not in attach mode) |
+| `l` | Sign an account in again (opens on the first account in `error`; not in attach mode). A panel shows the sign-in link, clickable and copied to the clipboard, and takes the pasted answer back, so it works over SSH — see [Signing in again from the TUI](accounts.md#signing-in-again-from-the-tui) |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
-| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder accounts, upstream and account proxies, sx.org) |
+| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder/sort accounts, upstream and account proxies, sx.org) |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
@@ -128,6 +128,8 @@ In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm
 The settings screen is a list, not a set of letter shortcuts: `↑`/`↓` move between rows, `←`/`→` change the value in place (threshold by 1%, probe by 30s, modes cycle), `Enter` opens a row that needs typing or a sub-screen, `Esc` goes back.
 
 **Reorder accounts** opens the account list with the same two pairs of keys and one extra job for them: `↑`/`↓` pick the account, `←`/`→` move *that account* up and down the list, `Enter` or `Esc` goes back. Every move applies as you make it and is written a moment after the keys stop (or on leaving the screen), so there is nothing to confirm and nothing to cancel. An account moves among the accounts of its own provider: a mixed Claude and Codex fleet is drawn grouped by provider, so a move that would cross into the other group does nothing. This is the order the list is **drawn** in and nothing else — rotation order is [`priority`](routing.md#choosing-an-account), which the screen never touches. `teamclaude attach` draws the same order: each account in `/teamclaude/status` carries its `displayOrder` (`null` until it has been placed).
+
+**Sort accounts** chooses what orders the list inside each provider group: **arranged** (your order, above), or the soonest reset of one window — **session reset** (five-hour), **weekly reset**, **S7 reset** or **F7 reset** — which puts the account whose window ends soonest at the top: the quota you lose first if nothing spends it. S7 and F7 read the all-models weekly on an account that has no Sonnet or Fable bucket of its own, since that is the window its Sonnet or Fable use counts against. Accounts with no reading for the window go last (for the session sort, that includes every account with no five-hour window open), and your arrangement breaks ties. A third-party backend sorts by its probed windows, with the monthly one standing in for a weekly reset the plan does not have. The reorder screen always shows the arranged order, because that is the order it edits. `teamclaude attach` reads the same `accountSort` from its own config file.
 
 ## Run Claude Code through the proxy
 
@@ -210,6 +212,7 @@ teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude rename <name> <new> # Rename an account (and the routes that list it)
 teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude threshold 90      # Utilization at which rotation leaves an account
 teamclaude distribute on     # Spread new sessions across equal-priority accounts
@@ -220,6 +223,8 @@ teamclaude warmup reset 15:30 --timezone Europe/Moscow
 teamclaude warmup rolling 15:30 --timezone Europe/Moscow
                              # Anchor resets at 15:30, then continue every 5h
 teamclaude api <path>        # Call an API endpoint with account credentials
+teamclaude callback login    # Sign in to callback.net: keep OAuth tokens in step across your installs
+teamclaude callback status   # (also: sync, logout) — see docs/accounts.md
 teamclaude update            # Check npm for a newer teamclaude and install it
 teamclaude switchyard login  # Log in to switchyard.work for usage push
 teamclaude mcp install       # Register the teamclaude-work MCP server with Claude Code
@@ -228,13 +233,17 @@ teamclaude version           # Print the installed version
 teamclaude help              # Show all commands
 ```
 
-`teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output. The JSON's `server.version` is the version of the process answering — read once at startup, so right after `teamclaude update` it still names the old code until the restart, where the installed CLI's `teamclaude version` already names the new one.
+`teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output. The JSON's `server.version` is the version of the process answering — read once at startup, so right after `teamclaude update` it still names the old code until the restart, where the installed CLI's `teamclaude version` already names the new one; `server.pid` is that process's id, so a caller can tell which server answered on a port. Each account's shared windows carry the time upstream last stated them, beside the value: `quota.unified5hSeenAt` and `quota.unified7dSeenAt`, in epoch milliseconds, for Claude and Codex accounts alike. Only a response or probe that states that window's utilization moves its stamp; a reset time alone, a failed probe or a model-scoped weekly bucket does not. (A Codex subscription states its only 5-hour window inside a model-named family; that reading is the account's 5-hour value, so it moves the 5-hour stamp.) The stamps survive a restart, and a value restored from a state file written before they existed reads `null` until upstream states it again, so `null` means "age unknown", never "just now".
 
 `teamclaude attach` opens the terminal dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the remote control exposes: `s` switches account, `R` reloads config. The browser dashboard adds the matching **Reload config** action plus a zero-spend **Probe quotas** action; settings editing and the request activity stream still stay in the server's own TUI because they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
 `teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`.
 
 ![teamclaude status output](assets/status-redacted.png)
+
+## Control routes under a second name
+
+Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
 
 ## Status dashboard (browser)
 
@@ -252,9 +261,11 @@ A **Routing** table above the accounts shows, for Fable, Sonnet, and any configu
 
 Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to traffic already running depends on `distributeSessions` — with it on, a conversation pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), everything follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
 
-A **Switch at __ %** control on the actions row sets the fleet-wide switch threshold, the utilization at which rotation leaves an account — the same setting as `teamclaude threshold <1-100>` and the TUI's settings screen, sent as `POST /teamclaude/threshold` with a `{"percent": 1-100}` body. Unlike the switch button this writes the config file and reloads, so it holds across a restart. One number replaces a per-bucket `switchThreshold` table, and the page says which buckets were dropped; per-account `accounts[].switchThreshold` overrides are untouched. The field follows changes made from the CLI, the TUI or another browser on the next poll, except while you are typing in it. A dashboard opened with a `proxy.clientKeys` key may not call it — the server answers 403, since a client key is a tenant of the proxy rather than its operator.
+A **Switch at __ %** control on the actions row sets the fleet-wide switch threshold, the utilization at which rotation leaves an account — the same setting as `teamclaude threshold <1-100>` and the TUI's settings screen, sent as `POST /teamclaude/threshold` with a `{"percent": 1-100}` body. Unlike the switch button this writes the config file and reloads, so it holds across a restart. One number replaces a per-bucket `switchThreshold` table, and the page says which buckets were dropped; per-account `accounts[].switchThreshold` overrides are untouched. The field follows changes made from the CLI, the TUI or another browser on the next poll, except while you are typing in it. A dashboard opened with a `proxy.clientKeys` key may not call it — the server answers 403, since a client key is a tenant of the proxy rather than its operator — so for such a key the page shows the number read-only, without the **Set** button.
 
-Beside it, each card has an **enable** / **disable** button (`POST /teamclaude/disable`) and, for an enabled account, **prioritize** and **deprioritize** (`POST /teamclaude/priority` with `place: "first"` / `"last"`). Unlike switch, these write the config file and reload the server — the same as `teamclaude disable`, `enable` and `priority --first` / `--last` — so they persist across restarts. A disabled account shows only the enable button: reordering an account that nothing will select is a control that looks like it does something and does not. The note under the cards reports the priority the account landed on, since a relative move picks a number the operator did not type. Both are refused when the page holds a `proxy.clientKeys` key rather than the shared proxy key; see the endpoint notes above.
+Beside it, each card has an **enable** / **disable** button (`POST /teamclaude/disable`) and, for an enabled account, **prioritize** and **deprioritize** (`POST /teamclaude/priority` with `place: "first"` / `"last"`). Unlike switch, these write the config file and reload the server — the same as `teamclaude disable`, `enable` and `priority --first` / `--last` — so they persist across restarts. A disabled account shows only the enable button: reordering an account that nothing will select is a control that looks like it does something and does not. The result of any card button — switch, enable/disable, prioritize, deprioritize — appears in a line directly above that card for a minute, so it is in view wherever the card sits on the page; a priority move reports the number the account landed on, since a relative move picks a number the operator did not type. Both are refused when the page holds a `proxy.clientKeys` key rather than the shared proxy key (see the endpoint notes above), so for such a key the page does not draw them. One line under the actions row says which client key the page is using, that account and settings changes need the proxy key, and has a **Change key** button back to the key box.
+
+The page knows which controls to hide from `caller` in `/teamclaude/status`: `{ "kind": "operator" | "client", "client": <client-key name or null>, "refused": [<paths>] }`. `refused` lists the control endpoints this key would get a 403 from, read from the same table the server's check uses, so the page and the server cannot disagree; it is empty for the shared proxy key and for a key-less loopback caller.
 
 
 ```

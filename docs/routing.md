@@ -18,7 +18,7 @@ How TeamClaude decides which account serves a request, and what it does when tha
 
 TeamClaude prefers to keep you on one account. It stays on the current one and only rotates when that account nears `switchThreshold` (default `0.98`).
 
-When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`.
+When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
 
 ## The two kinds of 429
 
@@ -68,6 +68,17 @@ retry if `sx.mode` is `429`, otherwise the inline wait, otherwise a 429 to the
 client with its `retry-after`. An IP-scoped limit is logged as such, since that
 is what an operator chasing a fleet-wide throttle is looking for.
 
+## Thinking blocks across accounts
+
+Since Claude Sonnet 5.5, a thinking block is bound to the **organization** whose account produced it ([preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking), "Thinking blocks stay with the account that produced them"). When a later request in the same conversation goes out on an account of a *different* organization, the API drops those earlier Sonnet 5.5 thinking blocks before the model sees them. The request succeeds and the answer comes back; the model simply answers that turn without the reasoning it had built up, and rebuilds it from the visible history. With the `thinking-binding-controls-2026-08-01` beta header the response lists each dropped block in `input_transformations` with the reason `organization_binding_mismatch`. Blocks from other models are not organization-bound (a model switch has its own, separate rules on that page).
+
+What that means for a pool:
+
+- **Accounts of one organization** (seats on a Team or Enterprise plan) are unaffected: the blocks stay readable on every account the conversation lands on.
+- **Accounts of different organizations** — the usual shape for a pool of personal Max subscriptions, where each login is its own org — pay the drop once per switch of a Sonnet 5.5 conversation: the threshold rotation, the [failover hop](#one-failover-hop-on-a-rate-limit), a re-routed [pin](#session-aware-routing), or a [`TC_ACCT`](#pin-a-session-to-one-account) change. It is the same shape as the cold prompt cache a switch already costs, and it costs nothing on the turns that stay put.
+
+TeamClaude does not strip or rewrite thinking blocks, so nothing is lost for good: the blocks stay in the client's history, and a conversation that moves back to its original organization reads them again. Which organization each account belongs to is on its row in `teamclaude status` and in the dashboard. Nothing here needs configuring; the levers that keep a conversation on one account — `switchThreshold`, `distributeSessions`, a route or a pin — are the ones that keep its reasoning too.
+
 ## Storm control
 
 When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
@@ -92,6 +103,21 @@ The same gate handles rate-limit 429s: TeamClaude pauses the account for the `re
 The per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. **Eligibility for a family model takes the higher of that family's bucket and the shared weekly one**, because family spend meters twice, once in the family bucket and once in the shared one. An account already past its shared weekly cap is therefore unavailable for family traffic too, rather than continuing to serve it and pushing the shared bucket further past the cap. The reverse still holds: a spent *family* bucket bars only that family. One consequence worth knowing: on the weekly buckets the family gate is the stricter of the two, so an account whose weekly quota lets it serve Fable can also serve Opus. That is a statement about quota only, since a `routes` pin or a blocklist can still make an account ineligible for one model and not the other. Requests are routed by their `model`, read exactly from the request body in both base-URL and MITM modes. `teamclaude status` shows this per account (a `Models` line) and any families it detects appear as **auto** routes.
 
 Advisor requests (Claude Code's `/advisor`) carry a **second** model nested in the tools array. Routing sees it too, so the request lands on an account eligible for both the main model and the advisor, falling back to main-model-only routing when no account can serve both.
+
+Claude Code declares the advisor tool on **every** request once an advisor model is configured, whether or not the advisor is ever called. So when only some accounts can serve the advisor's model — a route lists one account for `claude-fable-*`, or the others have spent their Fable bucket — all of that client's traffic is confined to them and the rest of the fleet idles. TeamClaude says so, at most once a minute:
+
+```
+[TeamClaude] Advisor model "claude-fable-5-1" narrows selection to 1 of 4 accounts — set advisorEligibility to "prefer" to route by request model instead
+```
+
+The counts are the accounts that can serve the request right now, and how many of those can also serve its advisor. `GET /teamclaude/status` carries the same reading as `advisorNarrowing` (`{ model, eligible, of, at }`, or `null` when the last advisor request was not narrowed), beside the mode in `advisorEligibility`.
+
+[`advisorEligibility`](configuration.md#fields) chooses what happens then:
+
+- `"strict"` (the default) keeps the request on the accounts that can serve both models. The advisor always has somewhere to run; the cost is the narrowing above.
+- `"prefer"` routes a narrowed request **by its main model only**, as though it declared no advisor: every account that can serve the main model is a candidate, under the ordinary rotation, session distribution included. The advisor call is then made by whichever account serves the request, which may be one your routes do not list for the advisor's model, or one whose bucket for it is spent — upstream fails that advisor call and Claude Code may stop using the advisor for the session. A route pin on the advisor's model is set aside with it. Where every candidate can serve the advisor, nothing changes, and the advisor model still takes part in selection.
+
+In both modes, no account able to serve the advisor at all means main-model-only routing, as before.
 
 Unwanted models can be rejected outright with [`blockedModels`](configuration.md#fields) instead of being forwarded — a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline.
 
@@ -141,6 +167,8 @@ When on, TeamClaude routes each **new** conversation to the least-loaded eligibl
 **What is pinned is a conversation, and one client session may hold many.** Claude Code sends the same session id for its own turns and for every subagent it launches, so a fan-out arrives as N concurrent requests wearing one tag; pinning on that tag alone held all N on one account, queueing behind its concurrency ceiling while equal-priority siblings sat idle — [#109](https://github.com/KarpelesLab/teamclaude/issues/109) again, re-entered through the tag rather than through rotation. Nothing was gained for it, because a subagent given a context of its own shares no prompt cache with its siblings or with its parent. So a request is filed under its session id narrowed by a digest of the conversation's opening — the identity of the cached prefix — and the agents of one session are placed like any other conversations. Both edges of that key are safe by construction: a conversation cannot be separated from its own cache, because a first message that changed is a cached prefix that changed with it; and two conversations that open identically simply share an account, each keeping its own cache.
 
 The exception proves the rule rather than breaking it. A subagent **forked** from its parent's context is sent with the parent's messages ahead of its own task, so its opening *is* the parent's opening: it keys the same and stays on the account already holding the cache it inherited. That is the right answer for those agents — they genuinely share a prefix, so co-locating them is what preserves it — but it does mean a fan-out of forks concentrates where a fan-out of fresh subagents spreads.
+
+**A message-thread continue is filed under the conversation it continues.** Once Claude Code runs a [message thread](accounts.md#message-threads), every turn after the first sends only its delta, so the body's first message is no longer the conversation's opening. The proxy remembers which conversation produced each threaded reply, and a `continue` naming that reply is placed with it: on the same pin, and so on the account that holds the thread, which is the only one that can continue it (any other answers `404 thread_not_found`, and the client then resends the whole conversation). A continue the proxy cannot trace, because it was restarted or the conversation was forgotten, names no conversation and pins by session alone.
 
 **What changes for a fleet upgrading to this.** Three things are counted or named differently than they were when the unit was the client session:
 

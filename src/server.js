@@ -10,11 +10,11 @@ import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
-import { TopLevelFieldFinder, modelGlobMatches, parseRequestStream } from './model.js';
+import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
@@ -28,6 +28,7 @@ import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
+import { envVar, legacyControlUrl } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -68,7 +69,7 @@ const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // rate-limit 429 never rotates accounts (that just moves the burst); it pauses
 // the account so concurrent requests wait, then retries the same account.
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
-  Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
+  Number(envVar('RATE_LIMIT_ABSORB_MAX_SECONDS')) || 60;
 // How long to wait before the one retry of a headerless 429 — a 429 carrying no
 // retry-after and no anthropic-ratelimit-* headers at all.
 //
@@ -101,7 +102,7 @@ const DEFAULT_HEADERLESS_429_RETRY_DELAY_MS = 2000;
  * @returns {number}
  */
 function resolveHeaderless429RetryDelayMs() {
-  const raw = process.env.TEAMCLAUDE_HEADERLESS_429_RETRY_DELAY_MS;
+  const raw = envVar('HEADERLESS_429_RETRY_DELAY_MS');
   if (raw == null || raw.trim() === '') return DEFAULT_HEADERLESS_429_RETRY_DELAY_MS;
   const env = Number(raw);
   if (env === 0) return 0;
@@ -128,6 +129,9 @@ export const KEEP_ALIVE_TIMEOUT_MS = 120_000;
 // own decision (disabled, capped), a credential or policy problem (error,
 // entitlement), or an eligibility rule (route) that no quota window governs.
 const RESET_CLEARS = new Set(['quota', 'throttled']);
+// The same for a banked Claude usage-limit reset, which also clears the windows
+// behind upstream's own `rejected` verdict.
+const CLAUDE_RESET_CLEARS = new Set(['quota', 'throttled', 'upstream-rejected']);
 
 /** Classify only the structured organization-policy denial observed upstream.
  * Message text and generic permission errors are deliberately not enough. */
@@ -174,6 +178,100 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
   'proxy-connection', 'te', 'trailer',
 ]);
+
+// Response headers describing the SERVING organization's billing state:
+// whether extra usage (overage) is enabled, why it is not, whether it is in
+// use, and what the org could upgrade to. A pool whose accounts belong to
+// several organizations returns these for whichever org served the response,
+// and Claude Code caches them as if they described the user's own org. After a
+// response from an org with extra usage disabled, the client can report "no
+// usage credits", block a model the pool still has plan quota for, or show a
+// consent dialog offering to enable paid overage on the wrong org.
+//
+// With `stripOverageHeaders: true` in the config, only this family
+// (anthropic-ratelimit-unified-overage-* and
+// anthropic-ratelimit-unified-upgrade-paths) is removed, and only from the
+// client-bound copy. The plan-quota headers (5h, 7d and 7d_oi status,
+// utilization and reset, the overall status, representative-claim, fallback)
+// always pass through: the client needs them for its usage readout, and they
+// describe the account that actually served the request. updateQuota receives
+// the unfiltered headers either way and does not persist the overage family.
+// The default (false) passes everything through unchanged.
+// relayHttpForward (absolute-form relay) is filtered too, for consistency:
+// Claude Code reaches Anthropic via CONNECT, so in practice it does not carry
+// these headers.
+const OVERAGE_HEADER_PREFIX = 'anthropic-ratelimit-unified-overage-';
+const OVERAGE_HEADER_NAMES = new Set(['anthropic-ratelimit-unified-upgrade-paths']);
+
+/**
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function isOverageHeader(name) {
+  const lk = String(name).toLowerCase();
+  return lk.startsWith(OVERAGE_HEADER_PREFIX) || OVERAGE_HEADER_NAMES.has(lk);
+}
+
+// Read off the shared config object (like eventLogging) when a request is
+// dispatched, so a reload applies to subsequent requests without a restart; a
+// request already in flight keeps the value it was dispatched with. Off
+// unless explicitly enabled.
+/**
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldStripOverageHeaders(config) {
+  return /** @type {{ stripOverageHeaders?: unknown } | null | undefined} */ (config)?.stripOverageHeaders === true;
+}
+
+// A third-party backend sends no `anthropic-ratelimit-unified-*` headers, so
+// Claude Code never learns its quota. With `synthesizeQuotaHeaders: true` the
+// windows the probe read (backend-quota.js) are stated in the client-bound
+// copy, in the shape Claude Code parses: a 0-1 utilization and an epoch-second
+// reset per window. A window without a future reset is left out, because
+// Claude Code drops it, and a monthly window has no header Claude Code reads.
+// Off unless explicitly enabled: Claude Code words its limit warnings for
+// Anthropic plans.
+const SYNTHESIZED_WINDOWS = /** @type {const} */ ([['fiveHour', '5h'], ['weekly', '7d']]);
+
+/**
+ * @param {Record<string, { utilization: number, resetAt: number|null }>|null|undefined} windows
+ * @param {number} [now]
+ * @returns {Record<string, string>}
+ */
+export function backendQuotaHeaders(windows, now = Date.now()) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [key, name] of SYNTHESIZED_WINDOWS) {
+    const w = windows?.[key];
+    if (!w || !Number.isFinite(w.utilization) || !(Number(w.resetAt) > now)) continue;
+    out[`anthropic-ratelimit-unified-${name}-utilization`] = String(w.utilization);
+    out[`anthropic-ratelimit-unified-${name}-reset`] = String(Math.floor(Number(w.resetAt) / 1000));
+  }
+  if (Object.keys(out).length) out['anthropic-ratelimit-unified-status'] = 'allowed';
+  return out;
+}
+
+/**
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldSynthesizeQuotaHeaders(config) {
+  return /** @type {{ synthesizeQuotaHeaders?: unknown } | null | undefined} */ (config)?.synthesizeQuotaHeaders === true;
+}
+
+/**
+ * The client-header flags a reload copies off the disk config, both sampled
+ * per request through the two functions above.
+ *
+ * @param {unknown} diskConfig
+ */
+export function reloadedHeaderFlags(diskConfig) {
+  return {
+    stripOverageHeaders: shouldStripOverageHeaders(diskConfig),
+    synthesizeQuotaHeaders: shouldSynthesizeQuotaHeaders(diskConfig),
+  };
+}
 
 // Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
 // gate use it). Returns false on any type/length mismatch without leaking timing.
@@ -321,6 +419,21 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
 ]);
 
 /**
+ * The caller of /teamclaude/status as the control plane sees it, so the
+ * dashboard can hide the controls this key would be refused instead of letting
+ * the operator find out by clicking. `refused` is read from the refusal map
+ * above, so the page and the gate cannot disagree. A key-less loopback caller
+ * and the shared proxy.apiKey are the operator; only a client key is refused.
+ *
+ * @param {string|null|undefined} client  the client-key name, or null
+ * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ */
+export function callerView(client) {
+  if (!client) return { kind: 'operator', client: null, refused: [] };
+  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
+}
+
+/**
  * @param {any} accountManager
  * @param {any} config
  * @param {any} [hooks]
@@ -356,6 +469,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
   const requestHandler = async (req, res) => {
     try {
+      // The control plane answers to its new name as well (issue #72): a URL
+      // under /teamrouter/ is rewritten to /teamclaude/ once, here, so every
+      // route below keeps matching the one spelling it always has. Only the
+      // proxy's own prefix is touched; nothing forwarded upstream starts with it.
+      const legacyUrl = legacyControlUrl(req.url);
+      if (legacyUrl) req.url = legacyUrl;
+
       // Dashboard page — served BEFORE the auth gate on purpose. The page is a
       // static asset containing no data: everything it shows comes from
       // /teamclaude/status, which stays behind the gate and is fetched by the
@@ -443,7 +563,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config)); return; }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -487,7 +607,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -797,7 +917,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // classification path like every other prefix test; `/tc-acct/` and an
       // absolute-form proxy URL do not start with it and are untouched.
       const controlPath = classificationPath(req.url);
-      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')) {
+      // Both prefixes: an encoded spelling of the new one (`/%74eamrouter/`)
+      // escapes the rewrite above and must not reach the forwarder either.
+      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')
+        || controlPath === '/teamrouter' || controlPath.startsWith('/teamrouter/')) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
         return;
@@ -897,7 +1020,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // path (req.tcClient): a handshake authenticated with a client key is
       // attributed to that client, or it is a channel the operator cannot see
       // under `clients` at all (#325).
-      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage });
+      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage, stripOverage: shouldStripOverageHeaders(config) });
     } catch (err) {
       console.error(`[TeamClaude] WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
       try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
@@ -1139,7 +1262,7 @@ export function describeConnectError(err) {
 // client's own headers — no account selection, no token injection,
 // content-encoding passed through (a transparent forward proxy). Anthropic is
 // HTTPS-only, so in practice this only ever sees third-party hosts.
-export function relayHttpForward(req, res) {
+export function relayHttpForward(req, res, stripOverage = false) {
   let target;
   try { target = new URL(req.url); } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1178,6 +1301,7 @@ export function relayHttpForward(req, res) {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
@@ -1205,7 +1329,103 @@ export function relayHttpForward(req, res) {
 // different account than the one you're logged in as"), Remote Control binds to
 // the wrong account, and artifacts get published under it. Observed on a live
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
-const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
+// Artifacts (deploy, read, list, comments) are served under /api/frame/*, owned
+// by the client's user like the identity plane above; a rotated account's token
+// sees them as not found.
+//
+// The Remote Control bridge is the same plane under other prefixes. Since
+// Claude Code 2.1.287 `claude remote-control` honours HTTPS_PROXY
+// (anthropics/claude-code#97352), so its control calls arrive here too:
+// /v1/environments/* registers the machine, polls it for work, acks and
+// heartbeats that work, reconnects and takes the machine offline;
+// /v1/sessions creates the sessions it serves and /v1/sessions/* drives them;
+// /v2/session_ingress/* and /v2/ccr-sessions/* are the session-scoped
+// endpoints those sessions use (MCP servers among them). Under a rotated token
+// the machine was registered under whichever account rotation picked, a
+// different org on each restart, and creating the session then answered 404.
+// The work poll drew a 401 from every account in turn: its bearer is the
+// environment secret that registration returned, not an OAuth token, so a
+// fleet token in its place can only be refused (ack and heartbeat carry the
+// work's session-ingress token the same way). Observed on a live fleet: 1286
+// "token rejected" lines in the 4h after the 2.1.287 update, against 31 in
+// the 24h before. The two /v1 prefixes also serve the public Managed Agents
+// API, whose environments and sessions belong to the organization that
+// created them, so rotation could not serve those across a multi-org pool
+// either.
+//
+// Each entry ends in '/', so it stops at a segment boundary: `/v1/sessions/`
+// does not take `/v1/sessionsX`. The entry without that slash, the collection
+// itself, matches as well, since a session is created with a bare
+// POST /v1/sessions (classificationPath has already dropped any `?beta=true`).
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/', '/api/frame/', '/v1/environments/', '/v1/sessions/', '/v2/session_ingress/', '/v2/ccr-sessions/'];
+
+/**
+ * Whether a classified path is on the client's own identity plane: below an
+ * entry of CLIENT_CREDENTIAL_PATHS, or the collection that entry names.
+ * @param {string} path
+ */
+function isClientCredentialPath(path) {
+  return CLIENT_CREDENTIAL_PATHS.some((p) => path.startsWith(p) || path === p.slice(0, -1));
+}
+
+/**
+ * The authority a request was addressed to, as the client wrote it: the
+ * `:authority` pseudo-header under HTTP/2 (the compat layer exposes it as
+ * `req.authority`, falling back to `host`), the Host header under HTTP/1.
+ * Under a terminated MITM tunnel that is the CONNECT target as the client sees
+ * it; on the base listener it is this proxy's own address.
+ * @param {any} req
+ * @returns {string|undefined}
+ */
+export function requestAuthority(req) {
+  return req?.authority || req?.headers?.host || req?.headers?.[':authority'];
+}
+
+/**
+ * The hostname inside an authority (`chatgpt.com:443`, `CHATGPT.COM.`), or null.
+ * @param {unknown} authority
+ */
+function hostOfAuthority(authority) {
+  if (typeof authority !== 'string' || !authority) return null;
+  // Lower-cased by the parser; a trailing dot is the same name, as in a CONNECT.
+  try { return new URL(`http://${authority}`).hostname.replace(/\.$/, '') || null; } catch { return null; }
+}
+
+/**
+ * Where a request that arrived on ANOTHER provider's intercepted host, but is
+ * not that provider's inference, is relayed with the client's own credential —
+ * or null when the request is ours to route.
+ *
+ * MITM terminates every intercepted host on one server, and the request path
+ * routes by its PATH alone (providerForPath): `/backend-api/codex/*` is Codex,
+ * everything else is Anthropic. That left every other request a Codex client
+ * makes on chatgpt.com — codex-cli 0.156's workspace discovery
+ * (`/backend-api/wham/accounts/check`), its plugin, MCP and settings calls —
+ * classified as Anthropic and sent to api.anthropic.com with a pooled Claude
+ * token, which answered 404; 0.156 refuses to start on that (#492). None of
+ * it is inference, and all of it belongs to the client's own ChatGPT login, so
+ * it goes to the host the client asked for, headers intact, the way
+ * `/v1/oauth/token` is relayed raw.
+ *
+ * The origin is the one that provider's accounts are reached at: the provider
+ * default (https://chatgpt.com) unless an account overrides `upstream`, in
+ * which case that gateway stands in for the host and gets the lot. Only a host
+ * this config intercepts qualifies — the rule hostMode applies to the CONNECT —
+ * and never the default provider's, whose traffic is routed as it always was.
+ *
+ * @param {{ authority: string|undefined, url: string|undefined, config: any, accounts?: any[] }} opts
+ * @returns {string|null}
+ */
+export function clientPassthroughOrigin({ authority, url, config, accounts = [] }) {
+  const host = hostOfAuthority(authority);
+  if (!host) return null;
+  const provider = providerForHost(host);
+  if (!provider || provider === DEFAULT_PROVIDER) return null;
+  if (!interceptHostsFor(config?.accounts || []).includes(host)) return null;
+  if (providerForPath(url || '/') === provider) return null;
+  const sample = accounts.find((a) => providerOf(a) === provider) || null;
+  return upstreamFor(sample || { provider }, null);
+}
 
 // Claude Code's session id is a UUID, but other clients tag sessions too, so
 // the shape is a conservative charset rather than the UUID grammar: wide enough
@@ -1236,11 +1456,30 @@ export function clientSessionId(headers) {
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
 /**
+ * The activity callbacks this listener reports through, all optional. The rest
+ * of the hooks object (reload, probeQuota, ...) passes through untyped. The
+ * text in each `info` comes from the client, so a consumer sanitises what it
+ * draws.
+ *
+ * onRequestModel runs up to twice for one request: with the model as soon as it
+ * is peeked from the stream, then with the model and effort once the whole body
+ * is in, when the request set an effort. onRequestEnd's info carries the same
+ * `model` and `effort`, null or absent where the request ended before either
+ * was read.
+ *
+ * @typedef {{
+ *   onRequestStart?: (id: number, info: Record<string, any>) => void,
+ *   onRequestModel?: (id: number, info: { model: string|null, effort?: string|null }) => void,
+ *   onRequestRouted?: (id: number, info: Record<string, any>) => void,
+ *   onRequestEnd?: (id: number, info: Record<string, any>) => void,
+ * } & Record<string, any>} ActivityHooks
+ */
+/**
  * @param {Object} opts
  * @param {Object} opts.accountManager
  * @param {string} opts.upstream
  * @param {string|null} [opts.logDir]
- * @param {Object} [opts.hooks]  activity callbacks (onRequestStart, onRequestEnd, ...), all optional
+ * @param {ActivityHooks} [opts.hooks]
  * @param {Object|null} [opts.sx]
  * @param {number} [opts.holdMs]
  * @param {Object} [opts.config]  the live config object; read per request, never copied
@@ -1310,7 +1549,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
+      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config), shouldStripOverageHeaders(config)); return; }
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -1357,7 +1596,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
       // likewise account-bound: files uploaded from claude.ai belong to the
       // paired identity, so fetching them with a rotated token 403s and Claude
-      // Code silently drops the image from the message.
+      // Code silently drops the image from the message. The Remote Control
+      // bridge's environments and sessions are bound to the client's login the
+      // same way (see CLIENT_CREDENTIAL_PATHS).
       //
       // Below the pin strip, so this reads the path that will actually be sent,
       // and on its classification form: `/%61pi/oauth/…`, `/api/oauth%2fprofile`,
@@ -1372,8 +1613,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Still ABOVE the TC_ACCT branch below, which does not touch req.url —
       // moving past it would turn an unknown TC_ACCT pin on an identity-plane
       // request into a 404 that it does not return today.
+      // A request on another provider's intercepted host that is not that
+      // provider's inference — a Codex client's workspace, plugin and settings
+      // calls on chatgpt.com — belongs to the client's own login there, not to
+      // either pool, and goes to that host as sent (#492). Before the identity
+      // plane below, which is Anthropic's.
+      const passthrough = clientPassthroughOrigin({ authority: requestAuthority(req), url: req.url, config, accounts: /** @type {any} */ (accountManager).accounts });
+      if (passthrough) { await relayStream(req, res, passthrough, sx, shouldStripOverageHeaders(config)); return; }
+
       const classifiedPath = classificationPath(req.url);
-      if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
+      if (isClientCredentialPath(classifiedPath)) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -1456,8 +1705,17 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // no `messages`, so the walk could only ever come back empty-handed — after
       // reading as far into a multi-megabyte body as its bound allows.
       const provider = providerForPath(req.url);
-      const conversation = sessionId && provider === DEFAULT_PROVIDER ? conversationDigest(body) : null;
-      const pinKey = pinKeyFor(sessionId, conversation);
+      const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
+        ? placeConversation(accountManager, body, sessionId)
+        : { conversation: null, pinKey: pinKeyFor(sessionId, null), onMessage: null };
+
+      // The reasoning effort the client asked for, for the activity view only:
+      // nothing routes on it. Read from the whole body rather than peeked from
+      // the stream like the model, since nothing needs it before the forward.
+      // Reported here, ahead of the forward, so the live row shows it for the
+      // whole wait.
+      const effort = parseRequestEffort(body, provider);
+      if (effort && !hideActivity) hooks.onRequestModel?.(reqId, { model, effort });
 
       // Model blocklist (issue #116): reject a request for a blocked model right
       // here instead of forwarding it. A model no account can serve (e.g. Fable
@@ -1472,7 +1730,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
         recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
         openEntry = null;   // this path owns the close below; the outer catch must not repeat it
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, effort, sessionId });
         return;
       }
 
@@ -1497,7 +1755,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // stripOverage and synthesizeQuota are sampled once here, at dispatch:
+      // retries and holds of this request keep them, and a reload applies to
+      // subsequent requests.
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Book the same tokens against the work context the session declared
       // through the teamclaude-work MCP server, when it declared one. Looked up
       // once per request: a claim made mid-stream applies from the next one.
@@ -1574,7 +1835,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null, client });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -1784,7 +2045,7 @@ function sxAgent(sx, targetHost) {
  * buffering, no timeout, no reconstruction — just pipe bytes both ways as they
  * arrive, exactly like a transparent proxy would.
  */
-function relayStream(req, res, upstream, sx) {
+function relayStream(req, res, upstream, sx, stripOverage = false) {
   const target = new URL(`${upstream}${req.url}`);
   /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
@@ -1806,6 +2067,7 @@ function relayStream(req, res, upstream, sx) {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
@@ -1923,7 +2185,7 @@ export function upgradeTarget(upstream, url) {
   return target;
 }
 
-export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log } = {}) {
+export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false } = {}) {
   const target = upgradeTarget(upstream, req.url);
   if (!target) {
     log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
@@ -1960,8 +2222,11 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     const headerLines = Object.entries(upstreamRes.headers)
-      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
-    socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\n\r\n`);
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    // Lines joined, one terminator: an empty header set must not leave a blank
+    // line inside (or an extra CRLF after) the response head.
+    socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines].join('\r\n') + '\r\n\r\n');
     if (upstreamHead?.length) socket.write(upstreamHead);
     if (head?.length) upstreamSocket.write(head);
     socket.pipe(upstreamSocket);
@@ -1995,9 +2260,10 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     log(`[TeamClaude] ${tag}WebSocket ${path} refused by upstream (${upstreamRes.statusCode})`);
     const headerLines = Object.entries(upstreamRes.headers)
       .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
-      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     try {
-      socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\nConnection: close\r\n\r\n`);
+      socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines, 'Connection: close'].join('\r\n') + '\r\n\r\n');
     } catch { /* already gone */ }
     upstreamRes.resume();
     socket.destroy();
@@ -2038,9 +2304,14 @@ async function refuseOversizedBody(req, res) {
 }
 
 /**
- * Relay a request to upstream with no header rewriting — pure passthrough.
+ * Relay a request to upstream on the client's own terms: no pooled account
+ * credentials are injected and the body goes through unchanged, with only
+ * content-type, accept and user-agent forwarded. On the way back the
+ * connection-specific and stale framing headers (transfer-encoding,
+ * connection, content-encoding, content-length) are dropped, and so is the
+ * per-org billing family when `stripOverage` is set (see isOverageHeader).
  */
-async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
+async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false) {
   const bodyChunks = [];
   let bodyBytes = 0;
   for await (const chunk of req) {
@@ -2071,6 +2342,7 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // a gzip'd upstream response reaches the client mis-framed / truncated.
       if (key === 'transfer-encoding' || key === 'connection' ||
           key === 'content-encoding' || key === 'content-length') continue;
+      if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);
@@ -2610,8 +2882,8 @@ const DEFAULT_STREAM_PEEK_HOLD_MS = 10_000;
  * @returns {{ budgetBytes: number, holdMs: number }}
  */
 export function resolveStreamPeekBounds() {
-  const budget = Number(process.env.TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES);
-  const hold = Number(process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS);
+  const budget = Number(envVar('STREAM_PEEK_BUDGET_BYTES'));
+  const hold = Number(envVar('STREAM_PEEK_HOLD_MS'));
   return {
     budgetBytes: budget > 0 ? budget : DEFAULT_STREAM_PEEK_BUDGET_BYTES,
     holdMs: hold > 0 ? hold : DEFAULT_STREAM_PEEK_HOLD_MS,
@@ -2897,11 +3169,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // window, and an account this request has already tried stays excluded from
     // the re-selection below whatever its windows then say. A credit spent on
     // any of those buys this request nothing.
-    const resettable = hooks.redeemCodexResetForPool && !ctx.resetRedeemTried
-      && (ctx.provider || DEFAULT_PROVIDER) === 'codex'
+    //
+    // A dry Claude pool is offered the same way, to the Claude redeemer, for a
+    // banked usage-limit reset — which also answers upstream's own `rejected`
+    // verdict, since a reset clears exactly the windows that verdict is about.
+    const resetProvider = ctx.provider || DEFAULT_PROVIDER;
+    const redeemHook = resetProvider === 'codex' ? hooks.redeemCodexResetForPool
+      : resetProvider === DEFAULT_PROVIDER ? hooks.redeemClaudeResetForPool : null;
+    const clears = resetProvider === 'codex' ? RESET_CLEARS : CLAUDE_RESET_CLEARS;
+    const resettable = redeemHook && !ctx.resetRedeemTried
       ? accountManager.accounts.filter((/** @type {Record<string, any>} */ a) =>
-        providerOf(a) === 'codex' && !ctx.tried.has(a.index)
-        && RESET_CLEARS.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
+        providerOf(a) === resetProvider && !ctx.tried.has(a.index)
+        // A third-party backend is an Anthropic-shaped account with no Anthropic
+        // reset to spend; Codex rows never carry one, so the test is Claude's alone.
+        && !(resetProvider === DEFAULT_PROVIDER && a.upstream)
+        && clears.has(accountManager.unavailableReason(a, ctx.model) ?? ''))
       : [];
     if (resettable.length) {
       // Once per request, whatever it decides: a redemption that reports success
@@ -2910,7 +3192,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.resetRedeemTried = true;
       let redeemed = false;
       try {
-        redeemed = !!(await hooks.redeemCodexResetForPool(resettable))?.redeemed;
+        redeemed = !!(await redeemHook?.(resettable))?.redeemed;
       } catch { /* a failed redemption must leave the refusal exactly as it was */ }
       if (redeemed) {
         // No upstream attempt was made, so this costs no retry from the budget:
@@ -3084,6 +3366,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (sendBody.length > 0) l.body('REQUEST BODY', sendBody, req.headers['content-type']);
   };
 
+  let activityOpened = false;
   try {
     // Storm control: pace requests onto a freshly-switched account so a failover
     // burst doesn't slam it all at once and cascade (issue #84). The slot is held
@@ -3095,6 +3378,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // is paused or ramping, which is exactly when clients give up, so leaving it
     // unmarked clustered false positives where the signal is read hardest.
     if (!await accountManager.admit(account.index, () => clientGone(res))) { ctx.abandoned = true; return; }
+    accountManager.beginActivity(account.index);
+    activityOpened = true;
     // This request may have selected the account before another in-flight request
     // observed an entitlement denial. Re-check after admission, when the queued
     // request is about to send, so the cooldown also drains that preselected
@@ -3148,6 +3433,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
+
+    // And a response that is not an error is proof its API key works: the 401
+    // cooldown and the count behind its length start over (#473). Only that —
+    // a 429 or a 5xx says nothing about the key either way.
+    if (upstreamRes.status < 400) accountManager.clearCredentialRejected(account.index);
 
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
@@ -3524,8 +3814,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // hours while three healthy siblings served none of them (#412). Like the
     // 403 above, the client must not see it: Claude Code reads a 401 as its own
     // login having died. So the account is skipped for this request and the
-    // request fails over. It also leaves rotation when nothing here can ever
-    // repair it: an API key, or an OAuth account with no refresh token to try.
+    // request fails over. It also leaves rotation when nothing here can
+    // repair it: an OAuth account with no refresh token to try, for good, and an
+    // API key for a cooldown that lengthens while it keeps being rejected — a
+    // gateway answers 401 with a good key when its own upstream is down (#473;
+    // see markCredentialRejected).
     // An account that DOES hold one only fails over. Its second 401 can be stale
     // news — the forced refresh is suppressed for a short floor after a
     // successful one (the refresh-storm guard), so the retry may have gone out
@@ -3607,11 +3900,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
+      // Per-org billing state, dropped when stripOverageHeaders is on (see
+      // isOverageHeader); updateQuota above already saw the full header set.
+      if (ctx.stripOverage === true && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
 
     // A headerless stream is told it is one (see `streamAssumed` above).
     if (streamAssumed) responseHeaders['content-type'] = contentType;
+
+    // A backend's probed windows, stated for the client only (see
+    // backendQuotaHeaders): updateQuota above already ran on the upstream's
+    // own headers, and an upstream that states its own unified quota is left
+    // alone rather than mixed with ours. An error response gets nothing: its
+    // `status: allowed` would be a verdict the proxy never made.
+    if (ctx.synthesizeQuota === true && upstreamRes.status < 400
+        && !Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-'))) {
+      Object.assign(responseHeaders, backendQuotaHeaders(account.quota?.backend?.windows));
+    }
 
     res.writeHead(upstreamRes.status, responseHeaders);
 
@@ -3635,7 +3941,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model);
+        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -3650,7 +3956,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -3778,6 +4084,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.proxyClosed = true;
       res.destroy();
     }
+  } finally {
+    // Outside-spend attribution counts this account as busy from dispatch until
+    // the response has fully ended, streams included (#475).
+    if (activityOpened) accountManager.endActivity(account.index);
   }
 }
 
@@ -3794,7 +4104,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
 
 function resolveBodyIdleTimeout() {
-  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
+  const env = Number(envVar('UPSTREAM_BODY_TIMEOUT_MS'));
   return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
 }
 
@@ -3822,7 +4132,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -3842,7 +4152,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   // remembers that it did — the incremental counters would book the turn again
   // if a second terminal event arrived. See parseSSEDataLine.
   const responsesTurn = { settled: false };
-  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn));
+  const usage = createSseLineScanner(line => parseSSEDataLine(line, accountIndex, accountManager, onUsage, merged, responsesTurn, onMessage));
 
   try {
     while (true) {
@@ -3998,12 +4308,14 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
  * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
  * @param {Record<string, any>|null} [merged]
  * @param {{settled: boolean}|null} [responsesTurn] this stream's "already booked" flag
+ * @param {((messageId: string) => void)|null} [onMessage] told the id `message_start` names
  */
-function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null) {
+function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, merged = null, responsesTurn = null, onMessage = null) {
   if (!line.startsWith('data: ')) return;
 
   try {
     const data = JSON.parse(line.slice(6));
+    if (data.type === 'message_start' && typeof data.message?.id === 'string') onMessage?.(data.message.id);
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
       onUsage?.(data.message.usage.input_tokens || 0, 0);
@@ -4065,9 +4377,19 @@ function recordContextUsage(store, workContext, accountManager, ctx, sessionId, 
   });
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null) {
+/**
+ * @param {Buffer} buffer
+ * @param {number} accountIndex
+ * @param {any} accountManager
+ * @param {((inputTokens: number, outputTokens: number) => void)|null} [onUsage]
+ * @param {string|null} [pinKey]
+ * @param {string|null} [model]
+ * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
+ */
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null) {
   try {
     const json = JSON.parse(buffer.toString());
+    if (json?.type === 'message' && typeof json.id === 'string') onMessage?.(json.id);
     if (json.usage) {
       // A buffered Responses body reports under the same two field NAMES with a
       // different meaning, so reading it as Anthropic's would book the cached
@@ -4144,6 +4466,62 @@ export function rewriteRequestBody(body, account, url, contentType) {
 // gets parsed for nothing. The parse below is what decides.
 const THREAD_MARKER = Buffer.from('"thread"');
 const CONTINUE_MARKER = Buffer.from('"continue"');
+
+/**
+ * The conversation an Anthropic request belongs to, the key it pins on, and,
+ * for a request in a message thread, how to remember the message answering it.
+ *
+ * A message-thread continue carries only the turn's delta, so its first message
+ * is not the conversation's opening: digesting it filed every turn as a new
+ * conversation, routed wherever a new one goes and away from the account holding
+ * the thread, which Anthropic answers with 404 `thread_not_found`. A continue
+ * belongs to the conversation that produced the message it follows, and one that
+ * cannot be traced names no conversation and pins by session, like any body
+ * without an opening.
+ *
+ * @param {any} accountManager
+ * @param {Buffer} body
+ * @param {string} sessionId
+ * @returns {{ conversation: string|null, pinKey: string|null, onMessage: ((messageId: string) => void)|null }}
+ */
+function placeConversation(accountManager, body, sessionId) {
+  const thread = requestThread(body);
+  const conversation = thread?.continues
+    ? accountManager.threadOwner(sessionId, thread.continues)?.conversation ?? null
+    : conversationDigest(body);
+  const pinKey = pinKeyFor(sessionId, conversation);
+  // What a later continue will name: the id of the message answering this one.
+  const onMessage = thread && pinKey
+    ? (/** @type {string} */ id) => accountManager.recordThreadMessage(pinKey, id, thread.continues)
+    : null;
+  return { conversation, pinKey, onMessage };
+}
+
+/**
+ * The message thread a request takes part in: null when its body names none,
+ * else `continues`, the id of the message a continue follows (null for a
+ * create). Read from the markers alone unless the body could be a continue, so a
+ * create, which carries the whole conversation, is never parsed for it. A body
+ * that merely mentions `"thread"` reads as a create; the cost is one message id
+ * remembered for a conversation that never continues it.
+ *
+ * Exported for tests.
+ *
+ * @param {Buffer|null|undefined} body
+ * @returns {{ continues: string|null }|null}
+ */
+export function requestThread(body) {
+  if (!Buffer.isBuffer(body) || !body.includes(THREAD_MARKER)) return null;
+  if (!body.includes(CONTINUE_MARKER)) return { continues: null };
+  try {
+    const thread = JSON.parse(body.toString('utf8'))?.thread;
+    if (!thread || typeof thread !== 'object') return null;
+    const continues = thread.type === 'continue' && typeof thread.previous_message_id === 'string';
+    return { continues: continues ? thread.previous_message_id : null };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Whether an `upstream` names Anthropic itself — a region pin or a mirror rather
@@ -4276,7 +4654,8 @@ export function rewriteModel(body, modelMap) {
 function blockingResets(accountManager, account, model) {
   const q = account.quota || {};
   /** @type {any[]} */
-  const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil];
+  const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil,
+    account.credentialRejectedUntil];
 
   if (q.unified5h != null && q.unified5h >= accountManager.thresholdFor('unified5h')) {
     resets.push(q.unified5hReset);

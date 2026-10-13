@@ -78,6 +78,10 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
+    const outside = outsideSpendText(account.quota?.outsideSpend);
+    if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
+    const forecast = forecastText(account.quota?.forecast, now);
+    if (forecast) lines.push(`  ${paint.dim('Forecast'.padEnd(8))} ${forecast}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
     const adaptive = adaptiveFor(status, nameText(account.name));
@@ -146,6 +150,7 @@ export const UNAVAILABLE_TEXT = {
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   routing: "the account's routing proxy is unreachable (cooldown)",
+  credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
@@ -195,6 +200,126 @@ export function spendLine(account, paint) {
 }
 
 /**
+ * The outside-spend read-out for one account, or null when it reports no
+ * weekly window (#475). One phrase per window, joined with " · ":
+ *
+ *   "4.0% of the week went elsewhere"          measured (0% is a real answer)
+ *   "Fable week: not measurable"               served at every reading
+ *   "week: not observed (quota probe off?)"    no fresh readings to compare
+ *
+ * Never "0%" for the last two: those are "no answer", not "nothing". The
+ * share is a floor — spend elsewhere while this proxy was also serving the
+ * account is not counted, and docs/quota.md says so.
+ *
+ * Pure and closure-free on purpose: the dashboard serializes it into its page
+ * with toString(), so the terminal and the browser say the same thing.
+ *
+ * @param {Record<string, {share: number|null, state: string, since: string|null}>|null|undefined} outsideSpend
+ * @returns {string|null}
+ */
+export function outsideSpendText(outsideSpend) {
+  var o = outsideSpend || {};
+  var keys = Object.keys(o).sort(function (a, b) {
+    if (a === 'unified7d') return -1;
+    if (b === 'unified7d') return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  if (!keys.length) return null;
+  var parts = keys.map(function (key) {
+    /** @type {{share?: number|null, state?: string}} */
+    var v = o[key] || {};
+    var family = key === 'unified7d' ? ''
+      : key === 'unified7dFable' ? 'fable'
+      : key === 'unified7dSonnet' ? 'sonnet'
+      : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    if (v.state === 'measured' && typeof v.share === 'number') {
+      return (Math.round(v.share * 1000) / 10).toFixed(1) + '% of the ' + label + ' went elsewhere';
+    }
+    if (v.state === 'not_measurable') return label + ': not measurable';
+    return label + ': not observed (quota probe off?)';
+  });
+  return parts.join(' \u00b7 ');
+}
+
+/**
+ * The burn-rate forecast for one account, or null when there is nothing to
+ * warn about (#475). One phrase per weekly window that, at the learned rate,
+ * reaches its switch threshold before it resets:
+ *
+ *   "week reaches 98% in ~31h, resets in 52h"
+ *   "Fable week reaches 95% in ~5h, resets in 2d4h"
+ *
+ * A window that resets first is the good case and gets no sentence; so does a
+ * window the learner has no rate for yet. A window with no known reset still
+ * gets the first half, since nothing says it resets first.
+ *
+ * Pure and closure-free on purpose, like outsideSpendText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {Record<string, {ratePerHour?: number|null, threshold?: number, reachesThresholdAt?: number|null, resetAt?: number|null}>|null|undefined} forecast
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function forecastText(forecast, now) {
+  var f = forecast || {};
+  /** @param {number} ms */
+  var dur = function (ms) {
+    var minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return minutes + 'm';
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + 'h';
+    var days = Math.floor(hours / 24);
+    var rem = hours % 24;
+    return rem ? days + 'd' + rem + 'h' : days + 'd';
+  };
+  var keys = Object.keys(f).sort(function (a, b) {
+    if (a === 'unified7d') return -1;
+    if (b === 'unified7d') return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  var parts = [];
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var v = f[key] || {};
+    var at = v.reachesThresholdAt;
+    if (typeof at !== 'number' || !(at > now)) continue;
+    var reset = typeof v.resetAt === 'number' && v.resetAt > now ? v.resetAt : null;
+    if (reset != null && at >= reset) continue;
+    var family = key === 'unified7d' ? ''
+      : key === 'unified7dFable' ? 'fable'
+      : key === 'unified7dSonnet' ? 'sonnet'
+      : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    var pct = typeof v.threshold === 'number' ? Math.round(v.threshold * 100) + '%' : 'its threshold';
+    var reach = dur(at - now);
+    var resetText = reset != null ? dur(reset - now) : null;
+    // Rounded separately, the two can print alike; the threshold still comes first.
+    parts.push(label + ' reaches ' + pct + ' in ~' + reach
+      + (resetText == null ? '' : resetText === reach ? ', just before it resets' : ', resets in ' + resetText));
+  }
+  return parts.length ? parts.join(' \u00b7 ') : null;
+}
+
+/**
+ * Whether an account's Session (five-hour) row is drawn. A plan that meters no
+ * session window (`sessionWindowStated === false`) has none to draw, and an
+ * empty row would read as "unknown" for something that does not exist. A
+ * reading that is still there is drawn whatever the flag says: it may be the
+ * one keeping the account out of rotation.
+ *
+ * One rule for `teamclaude status`, the TUI row and the dashboard card (#511).
+ * Closure-free: the dashboard serializes it into its page with toString().
+ *
+ * @param {{sessionWindowStated?: boolean, unified5h?: number|null}|null|undefined} quota
+ * @returns {boolean}
+ */
+export function showSessionRow(quota) {
+  var q = quota || {};
+  return q.sessionWindowStated !== false || q.unified5h != null;
+}
+
+/**
  * The free-reset-credit line, or null when this account holds none.
  *
  * Its own line rather than another bar: every bar above measures an allowance
@@ -218,6 +343,7 @@ export function resetCreditLine(account, paint, now = Date.now()) {
   const noun = `free rate-limit reset ${available === 1 ? 'credit' : 'credits'}`;
   const notes = [];
   if (credits.applicable === 0) notes.push('none applicable to a window right now');
+  if (Number.isFinite(credits.expiresAt)) notes.push(`expires ${formatDuration(credits.expiresAt - now)}`);
   if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
   const note = notes.length ? ` — ${notes.join(', ')}` : '';
   return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
@@ -232,8 +358,8 @@ export const RESET_CREDIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * How many reset credits to REPORT for this quota: the held count while the
- * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS or states
- * no positive count. One rule for the status screen and the TUI row, so the two
+ * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS, past its
+ * stated `expiresAt`, or states no positive count. One rule for the status screen and the TUI row, so the two
  * cannot disagree about whether a credit is there (the dashboard page applies
  * the same cut-off in its own serialized helper).
  *
@@ -249,13 +375,18 @@ export function heldResetCredits(quota, now = Date.now()) {
   const available = credits?.available;
   if (!Number.isFinite(available) || available <= 0) return 0;
   if (Number.isFinite(credits.seenAt) && now - credits.seenAt > RESET_CREDIT_MAX_AGE_MS) return 0;
+  // A grant past its stated expiry is gone whatever the last reading said.
+  if (Number.isFinite(credits.expiresAt) && credits.expiresAt <= now) return 0;
   return available;
 }
 
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
-  const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  const err = reason === 'error' ? account.errorReason : null;
+  const text = err
+    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
+    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
   // An account serving as the extra-usage fallback reads as out of quota like
   // any other, yet is taking traffic and billing for it. Say so on the line
   // that would otherwise tell the operator it is idle.
@@ -545,6 +676,11 @@ function formatAccountStatus(account, now, paint) {
     parts.push(paint.yellow(`routing proxy down, retry in ${formatDuration(routingAt - now)}`));
   }
 
+  const credentialAt = parseTs(account.credentialRejectedUntil);
+  if (credentialAt && credentialAt > now) {
+    parts.push(paint.yellow(`API key rejected (401), retry in ${formatDuration(credentialAt - now)}`));
+  }
+
   return parts.join(' / ');
 }
 
@@ -675,7 +811,9 @@ function quotaLines(account, now, paint) {
   const cap = bucket => resolveMaxUsage(account.maxUsage, bucket);
 
   if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
-    lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
+    if (showSessionRow(quota)) {
+      lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
+    }
     lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));
